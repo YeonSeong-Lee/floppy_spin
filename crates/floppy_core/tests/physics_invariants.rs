@@ -559,3 +559,107 @@ fn launch_quality_scales_spin_and_spawns_on_the_circle_and_grounds_out_passively
         "expected both tops grounded within 300 steps"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the M2 verifier findings (fixed post-review).
+// ---------------------------------------------------------------------------
+
+/// Verifier BLOCKER #2: a grounded, undisturbed top must actually settle to
+/// vertical rest. The original gentle-contact reprojection renormalized
+/// numeric noise back into a full-strength, mostly-vertical velocity, so
+/// `vel.y` cycled between -0.5 and -2.2 m/s forever on a "resting" top.
+#[test]
+fn resting_top_settles_to_near_zero_velocity() {
+    let top = make_top(
+        Vec3::new(0.0, arena::height(0.0, 0.0), 0.0),
+        Vec3::default(),
+        TUNE.spin_max,
+        1,
+        true,
+        keystone_stats(),
+    );
+    let mut world = world_with(top, orbit_dummy(2.6));
+    for _ in 0..300 {
+        world.step(NO_INPUT);
+    }
+    let v = world.tops[0].vel;
+    assert!(v.y.abs() < 0.05, "resting vel.y = {}", v.y);
+    assert!(
+        v.x.abs() < 0.2 && v.z.abs() < 0.2,
+        "resting horizontal vel = ({}, {})",
+        v.x,
+        v.z
+    );
+}
+
+/// Verifier BLOCKER #1: a hard landing must rebound UP (positive vel.y),
+/// not accelerate into the floor (the sign was inverted).
+#[test]
+fn hard_landing_bounces_upward() {
+    let top = make_top(
+        Vec3::new(0.0, arena::height(0.0, 0.0) + 3.0, 0.0),
+        Vec3::default(),
+        TUNE.spin_max,
+        1,
+        false,
+        keystone_stats(),
+    );
+    let mut world = world_with(top, corner_dummy());
+    for s in 0..200u32 {
+        world.step(NO_INPUT);
+        let landed = world
+            .events
+            .iter()
+            .any(|e| matches!(e, BattleEvent::Landed { who: 0, .. }));
+        if landed {
+            assert!(
+                world.tops[0].vel.y > 0.0,
+                "post-landing vel.y = {} at step {s} (must rebound upward)",
+                world.tops[0].vel.y
+            );
+            return;
+        }
+    }
+    panic!("top never hard-landed within 200 steps");
+}
+
+/// Verifier MAJOR #3: one top toppling and the other ringing out in the SAME
+/// step is a Simultaneous outcome (round replay, SPEC §6.5), and the event
+/// stream matches the recorded outcome.
+#[test]
+fn cross_type_double_out_is_simultaneous() {
+    // top0: spin so low the next decay tick zeroes it (stamina-out).
+    let t0 = make_top(
+        Vec3::new(0.0, arena::height(0.0, 0.0), 0.0),
+        Vec3::default(),
+        0.05,
+        1,
+        true,
+        keystone_stats(),
+    );
+    // top1: one integration step from crossing RING_OUT_RADIUS outward.
+    let t1 = make_top(
+        Vec3::new(9.55, arena::height(9.55, 0.0), 0.0),
+        Vec3::new(8.0, 0.0, 0.0),
+        TUNE.spin_max,
+        1,
+        true,
+        keystone_stats(),
+    );
+    let mut world = world_with(t0, t1);
+    world.step(NO_INPUT);
+    assert!(
+        matches!(world.outcome, Some(Outcome::Simultaneous)),
+        "expected Simultaneous, got {:?} (top1 r = {})",
+        world.outcome,
+        r_of(&world.tops[1])
+    );
+    assert!(world
+        .events
+        .iter()
+        .any(|e| matches!(e, BattleEvent::Topple { who: 0 })));
+    assert!(world
+        .events
+        .iter()
+        .any(|e| matches!(e, BattleEvent::RingOut { who: 1 })));
+}

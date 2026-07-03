@@ -301,6 +301,12 @@ pub struct LaunchParams {
 pub struct World {
     pub tops: [Top; 2],
     pub rng: Rng,
+    /// EXECUTED-step counter. Deliberately frozen during hit-stop and after
+    /// an outcome (those calls are whole-step skips, SPEC §5). Duration
+    /// timers built in M4+ (Crash-Out window, special durations) must use
+    /// their own counters decremented inside the step body — which freeze
+    /// identically — and must NOT be measured as differences of this counter
+    /// across hit-stop (M2 verifier finding #5).
     pub step: u64,
     pub hitstop: u8,
     pub outcome: Option<Outcome>,
@@ -310,6 +316,14 @@ pub struct World {
 /// Build one top's initial state for the Launch phase (game_design.md §4):
 /// spawns on the launch circle, aimed 65% toward center / 35% tangential.
 fn spawn_launch_top(p: &LaunchParams) -> Top {
+    // System-boundary validation (launch params arrive from UI/AI code):
+    // clamp to the documented ranges rather than trusting the caller — a
+    // garbage depth would otherwise produce a garbage (even inward-negative)
+    // launch speed (M2 verifier finding #7).
+    let depth = p.depth.clamp(0.4, 1.0);
+    let power = p.power.clamp(0.0, 1.0);
+    let quality = p.quality.clamp(1.0, 1.25);
+
     let x = fixmath::cos(p.heading) * TUNE.launch_radius;
     let z = fixmath::sin(p.heading) * TUNE.launch_radius;
     let y = arena::height(x, z) + TUNE.launch_drop_height;
@@ -317,10 +331,10 @@ fn spawn_launch_top(p: &LaunchParams) -> Top {
     let to_center = Vec2::new(-x, -z).normalize_or_zero();
     let tangent = Vec2::new(-to_center.y, to_center.x);
     let aim = (to_center.scaled(0.65) + tangent.scaled(0.35)).normalize_or_zero();
-    let speed = TUNE.launch_speed_base + TUNE.launch_speed_depth * p.depth;
+    let speed = TUNE.launch_speed_base + TUNE.launch_speed_depth * depth;
     let vel = Vec3::new(aim.x * speed, 0.0, aim.y * speed);
 
-    let spin = ((TUNE.launch_spin_base + TUNE.launch_spin_power * p.power) * p.quality)
+    let spin = ((TUNE.launch_spin_base + TUNE.launch_spin_power * power) * quality)
         .clamp(0.0, TUNE.spin_max);
 
     Top {
@@ -383,31 +397,29 @@ impl World {
             self.step_integrate_and_terrain(i);
         }
 
-        // Phase 5: spin decay + precession + topple/stamina-out check.
-        let mut stamina_out = [false, false];
-        for (i, out) in stamina_out.iter_mut().enumerate() {
-            *out = self.step_spin_and_precession(i);
-        }
-        if self.outcome.is_none() {
-            self.outcome = match stamina_out {
-                [true, true] => Some(Outcome::Simultaneous),
-                [true, false] => Some(Outcome::StaminaOut { loser: 0 }),
-                [false, true] => Some(Outcome::StaminaOut { loser: 1 }),
-                [false, false] => None,
-            };
+        // Phase 5: spin decay + precession.
+        for i in 0..2 {
+            self.step_spin_and_precession(i);
         }
 
         // Phase 6: single-pair collision.
         self.step_collision();
 
-        // Phase 7: ring-out check.
-        self.step_ring_out();
-
-        // Final clamp pass (belt-and-suspenders — HARD RULES: clamp
-        // aggressively every step) + phase 8 step counter.
+        // Phase 7: final clamp pass (belt-and-suspenders — HARD RULES: clamp
+        // aggressively every step).
         for top in &mut self.tops {
             finalize_clamps(top);
         }
+
+        // Phase 8: out conditions, evaluated ATOMICALLY at the end of the
+        // step from final state (M2 verifier findings #3/#4): everything
+        // within a step happens first, then the round is decided once. This
+        // makes a same-step cross-type double-out (one top toppling while
+        // the other rings out) a genuine Simultaneous, and it means a
+        // collision drain that zeroes spin is caught in the same step it
+        // happened rather than one step later.
+        self.resolve_outs();
+
         self.step += 1;
     }
 
@@ -518,9 +530,11 @@ impl World {
                 if impact > 2.0 {
                     // Hard vertical landing: a genuine impact, so let the
                     // into-surface component actually dissipate (SPEC-literal
-                    // `v -= n*(v.n)`), then add the small bounce.
+                    // `v -= n*(v.n)`), then add the small upward rebound
+                    // (positive: away from the surface — M2 verifier BLOCKER
+                    // #1 had this sign inverted, burying tops into the floor).
                     top.vel = top.vel - n.scaled(v_n);
-                    top.vel.y = -impact * 0.25;
+                    top.vel.y = impact * 0.25;
                     self.events.push(BattleEvent::Landed {
                         who: i as u8,
                         impact,
@@ -539,9 +553,22 @@ impl World {
                     // speed from the curvature alone, so preserve `|vel|`
                     // and only correct its direction. Hard impacts (above)
                     // still dissipate energy as specified.
+                    //
+                    // Speed is preserved ONLY when real tangential motion
+                    // exists. For a settling top the velocity is essentially
+                    // pure into-surface; the tangential remainder is numeric
+                    // noise (the approximate-rsqrt normal leaves ~1e-5
+                    // residue), and renormalizing that noise to full |vel|
+                    // resurrected the killed component in a junk direction —
+                    // the top never came to rest (M2 verifier BLOCKER #2).
                     let speed = top.vel.length();
-                    let tangential = (top.vel - n.scaled(v_n)).normalize_or_zero();
-                    top.vel = tangential.scaled(speed);
+                    let tangential = top.vel - n.scaled(v_n);
+                    let min_tangent = 0.15 * speed;
+                    if tangential.length_sq() > min_tangent * min_tangent {
+                        top.vel = tangential.normalize_or_zero().scaled(speed);
+                    } else {
+                        top.vel = tangential;
+                    }
                 }
             }
             top.grounded = true;
@@ -551,8 +578,10 @@ impl World {
         }
     }
 
-    /// Returns `true` if this top hit a stamina-out condition this step.
-    fn step_spin_and_precession(&mut self, i: usize) -> bool {
+    /// Spin decay + precession/wobble update. Out conditions are NOT decided
+    /// here — [`World::resolve_outs`] evaluates them atomically at the end of
+    /// the step (M2 verifier findings #3/#4).
+    fn step_spin_and_precession(&mut self, i: usize) {
         let top = &mut self.tops[i];
 
         top.spin -= top.stats.decay_per_s() * SIM_DT;
@@ -585,13 +614,6 @@ impl World {
 
         top.tilt =
             Vec2::new(fixmath::cos(top.tilt_phase), fixmath::sin(top.tilt_phase)).scaled(new_mag);
-
-        let toppled =
-            top.spin <= 0.0 || (new_mag > TUNE.topple_tilt && top.spin < TUNE.topple_spin);
-        if toppled {
-            self.events.push(BattleEvent::Topple { who: i as u8 });
-        }
-        toppled
     }
 
     fn step_collision(&mut self) {
@@ -715,74 +737,125 @@ impl World {
         };
     }
 
-    fn step_ring_out(&mut self) {
-        let mut out = [false, false];
-        for (i, out_i) in out.iter_mut().enumerate() {
-            let p = self.tops[i].pos;
-            let r = fixmath::sqrt(p.x * p.x + p.z * p.z);
-            *out_i = r > arena::RING_OUT_RADIUS;
+    /// Evaluate BOTH out conditions for BOTH tops from final end-of-step
+    /// state and commit the outcome once (atomic — M2 verifier findings
+    /// #3/#4). A top hitting both conditions in the same step counts as
+    /// stamina-out (its spin reached zero; documented precedence). Events
+    /// match the recorded outcome exactly.
+    fn resolve_outs(&mut self) {
+        let mut stamina = [false, false];
+        let mut ring = [false, false];
+        for i in 0..2 {
+            let top = &self.tops[i];
+            stamina[i] = top.spin <= 0.0
+                || (top.tilt.length() > TUNE.topple_tilt && top.spin < TUNE.topple_spin);
+            let r = fixmath::sqrt(top.pos.x * top.pos.x + top.pos.z * top.pos.z);
+            ring[i] = r > arena::RING_OUT_RADIUS;
         }
-        if !out[0] && !out[1] {
-            return;
-        }
-        for (i, &out_i) in out.iter().enumerate() {
-            if out_i {
+        for i in 0..2 {
+            if stamina[i] {
+                self.events.push(BattleEvent::Topple { who: i as u8 });
+            } else if ring[i] {
                 self.events.push(BattleEvent::RingOut { who: i as u8 });
             }
         }
-        if self.outcome.is_none() {
-            self.outcome = match out {
-                [true, true] => Some(Outcome::Simultaneous),
-                [true, false] => Some(Outcome::RingOut { loser: 0 }),
-                [false, true] => Some(Outcome::RingOut { loser: 1 }),
-                [false, false] => unreachable!(),
-            };
-        }
+        let out = [stamina[0] || ring[0], stamina[1] || ring[1]];
+        self.outcome = match out {
+            [true, true] => Some(Outcome::Simultaneous),
+            [true, false] => Some(if stamina[0] {
+                Outcome::StaminaOut { loser: 0 }
+            } else {
+                Outcome::RingOut { loser: 0 }
+            }),
+            [false, true] => Some(if stamina[1] {
+                Outcome::StaminaOut { loser: 1 }
+            } else {
+                Outcome::RingOut { loser: 1 }
+            }),
+            [false, false] => None,
+        };
     }
 
     /// Fixed-order serialization of ALL sim state (SPEC §5 determinism
     /// fingerprint): every `f32` via `to_bits()`, ints/bools as `u32`, the
     /// RNG's stream position, and the outcome discriminant.
     pub fn state_hash(&self) -> u64 {
+        // Exhaustive destructures (no `..`) so that adding a field to World,
+        // Top, or Stats without deciding whether to hash it is a COMPILE
+        // error, not a silent determinism blind spot (M2 verifier finding
+        // #6). `events` is deliberately unhashed: it is a per-step output
+        // channel for render/audio, not sim state.
+        let World {
+            tops,
+            rng,
+            step,
+            hitstop,
+            outcome,
+            events: _,
+        } = self;
         let mut words: Vec<u32> = Vec::with_capacity(64);
-        for top in &self.tops {
-            words.push(top.pos.x.to_bits());
-            words.push(top.pos.y.to_bits());
-            words.push(top.pos.z.to_bits());
-            words.push(top.vel.x.to_bits());
-            words.push(top.vel.y.to_bits());
-            words.push(top.vel.z.to_bits());
-            words.push(top.spin.to_bits());
-            words.push(top.spin_dir as i32 as u32);
-            words.push(top.tilt.x.to_bits());
-            words.push(top.tilt.y.to_bits());
-            words.push(top.tilt_phase.to_bits());
-            words.push(top.radius.to_bits());
-            words.push(top.height.to_bits());
-            words.push(top.stats.atk as u32);
-            words.push(top.stats.def as u32);
-            words.push(top.stats.sta as u32);
-            words.push(top.stats.wgt as u32);
-            words.push(top.stats.spd as u32);
-            words.push(top.stats.mtr as u32);
-            words.push(top.grounded as u32);
-            words.push(top.dash_cd as u32);
-            words.push(top.dash_active as u32);
-            words.push(top.meter.to_bits());
-            words.push(top.airdash_used as u32);
+        for top in tops {
+            let Top {
+                pos,
+                vel,
+                spin,
+                spin_dir,
+                tilt,
+                tilt_phase,
+                radius,
+                height,
+                stats,
+                grounded,
+                dash_cd,
+                dash_active,
+                meter,
+                airdash_used,
+            } = *top;
+            let Stats {
+                atk,
+                def,
+                sta,
+                wgt,
+                spd,
+                mtr,
+            } = stats;
+            words.push(pos.x.to_bits());
+            words.push(pos.y.to_bits());
+            words.push(pos.z.to_bits());
+            words.push(vel.x.to_bits());
+            words.push(vel.y.to_bits());
+            words.push(vel.z.to_bits());
+            words.push(spin.to_bits());
+            words.push(spin_dir as i32 as u32);
+            words.push(tilt.x.to_bits());
+            words.push(tilt.y.to_bits());
+            words.push(tilt_phase.to_bits());
+            words.push(radius.to_bits());
+            words.push(height.to_bits());
+            words.push(atk as u32);
+            words.push(def as u32);
+            words.push(sta as u32);
+            words.push(wgt as u32);
+            words.push(spd as u32);
+            words.push(mtr as u32);
+            words.push(grounded as u32);
+            words.push(dash_cd as u32);
+            words.push(dash_active as u32);
+            words.push(meter.to_bits());
+            words.push(airdash_used as u32);
         }
-        words.push(self.step as u32);
-        words.push((self.step >> 32) as u32);
-        words.push(self.hitstop as u32);
-        let (disc, loser): (u32, u32) = match self.outcome {
+        words.push(*step as u32);
+        words.push((*step >> 32) as u32);
+        words.push(*hitstop as u32);
+        let (disc, loser): (u32, u32) = match outcome {
             None => (0, 0),
-            Some(Outcome::RingOut { loser }) => (1, loser as u32),
-            Some(Outcome::StaminaOut { loser }) => (2, loser as u32),
+            Some(Outcome::RingOut { loser }) => (1, *loser as u32),
+            Some(Outcome::StaminaOut { loser }) => (2, *loser as u32),
             Some(Outcome::Simultaneous) => (3, 0),
         };
         words.push(disc);
         words.push(loser);
-        let rng_state = self.rng.state();
+        let rng_state = rng.state();
         words.push(rng_state as u32);
         words.push((rng_state >> 32) as u32);
         crate::hash::hash_u32s(&words)

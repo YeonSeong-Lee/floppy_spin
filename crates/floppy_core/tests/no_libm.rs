@@ -102,7 +102,16 @@ fn trailing_ident(s: &str) -> &str {
 }
 
 /// Scan one line for banned calls; returns the banned pattern hit, if any.
+/// The comment tail (from the first `//`) is stripped first: doc comments
+/// legitimately DISCUSS banned calls (e.g. "not `.round()`, which is
+/// banned"), and flagging prose would train people to write worse docs.
+/// Known accepted blind spot: a `//` inside a string literal truncates the
+/// scan of that line's remainder.
 fn line_violation(line: &str) -> Option<String> {
+    let line = match line.find("//") {
+        Some(pos) => &line[..pos],
+        None => line,
+    };
     for name in BANNED {
         let method_form = format!(".{name}(");
         if line.contains(&method_form) {
@@ -191,6 +200,11 @@ fn scanner_catches_both_spellings() {
     assert!(line_violation("let a = crate::fixmath::atan2(y, x);").is_none());
     // Aliased module: flagged by design (safe-direction false positive).
     assert!(line_violation("let a = fm::sin(x);").is_some());
+    // Comments merely DISCUSSING banned calls are not violations…
+    assert!(line_violation("// truncating cast, not `.round()`, which is banned").is_none());
+    assert!(line_violation("//! `.round()` and `.fract()` are banned").is_none());
+    // …but code before the comment is still scanned.
+    assert!(line_violation("let a = x.sin(); // see docs").is_some());
     // fixmath may only vouch for functions it actually exports.
     assert!(line_violation("let a = fixmath::powf(x, y);").is_some());
     assert!(line_violation("let a = x.floor();").is_none());
