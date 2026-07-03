@@ -1,0 +1,6 @@
+//! Host-verification encoders/parsers: PNG, WAV, PE import table. Zero deps.
+#![forbid(unsafe_code)]
+
+pub mod pe;
+pub mod png;
+pub mod wav;

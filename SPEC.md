@@ -246,8 +246,11 @@ table); lower tiers don't.
    (per-channel mean abs diff ≤ 2, ≤1% pixels above diff 24) against checked-in goldens.
 3. **`cargo run --bin gate`** (also via `tools/size_check.sh`): fails if
    `floppy_spin.exe` > 1,474,560 bytes; parses the PE import table and fails on any
-   import outside the allowlist {KERNEL32.dll, USER32.dll, GDI32.dll, WINMM.dll}
-   (case-insensitive). This is the objdump-equivalent, implemented dependency-free.
+   import outside the allowlist {kernel32.dll, user32.dll, gdi32.dll, winmm.dll,
+   msvcrt.dll, ntdll.dll} plus the `api-ms-win-*` API-set prefix (case-insensitive).
+   msvcrt/ntdll/api-sets are what the windows-gnu ABI links by construction (measured
+   2026-07-04 on the skeleton exe); all ship with Windows. This is the
+   objdump-equivalent, implemented dependency-free.
 4. **`cargo clippy` / `cargo fmt --check`** clean.
 5. Real-hardware Windows checks at ship: key/XInput feel, glitch-free waveOut, GDI
    blit pacing. (XInput, if added, is loaded via `LoadLibraryW` at runtime — it must not

@@ -1,0 +1,39 @@
+[package]
+name = "floppy_spin"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "floppy_spin"
+path = "src/main.rs"
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
+
+[[bin]]
+name = "gate"
+path = "src/bin/gate.rs"
+
+[dependencies]
+floppy_core = { path = "crates/floppy_core" }
+floppy_render = { path = "crates/floppy_render" }
+floppy_audio = { path = "crates/floppy_audio" }
+floppy_io = { path = "crates/floppy_io" }
+
+[workspace]
+members = [
+    "crates/floppy_core",
+    "crates/floppy_render",
+    "crates/floppy_audio",
+    "crates/floppy_io",
+]
+
+# Ship profile (SPEC C10). Applies to all bins; only floppy_spin.exe is the shipped
+# artifact and the only one the size gate measures.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
