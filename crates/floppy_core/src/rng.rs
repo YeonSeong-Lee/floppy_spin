@@ -3,7 +3,11 @@
 //! consume the RNG at fixed, scripted points so replays stay bit-identical.
 
 /// `xorshift64*` generator. A single `u64` of state; the public API never
-/// exposes the raw state so its encoding can change without breaking callers.
+/// exposes the raw state so its encoding can change without breaking callers
+/// (the [`Rng::state`] getter below is the one deliberate exception, added
+/// for M2's `World::state_hash` — it must fold the RNG stream position into
+/// the determinism fingerprint).
+#[derive(Clone, Copy, Debug)]
 pub struct Rng(u64);
 
 /// Fixed nonzero replacement for a `0` seed — `xorshift` is stuck at all-zero
@@ -49,6 +53,13 @@ impl Rng {
     /// cheapest bit slice that can't produce a biased/rounded distribution).
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 * (1.0 / 16_777_216.0)
+    }
+
+    /// Raw internal state word, exposed only so callers can fold the RNG's
+    /// stream position into a determinism fingerprint (SPEC §5) without the
+    /// sim needing to know the generator's internals otherwise.
+    pub fn state(&self) -> u64 {
+        self.0
     }
 
     /// Uniform integer in `[lo, hi)`. Returns `lo` if the range is empty or

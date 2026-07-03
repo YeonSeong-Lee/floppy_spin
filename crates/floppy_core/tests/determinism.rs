@@ -1,134 +1,125 @@
-//! M1 placeholder determinism harness (SPEC §5, §12). `floppy_core` has no
-//! real sim yet — this file exercises the exact pattern the real one will
-//! use from M2 onward: seed -> Rng -> fixmath-driven stepping ->
-//! `InputState`-scripted impulses -> `hash_u32s` over the raw f32 state bits.
-//! Delete this file once the real M2 sim ships with its own determinism test
-//! covering the same property.
+//! M2 determinism harness (SPEC §5, §12) over the real `physics::World`,
+//! replacing the M1 placeholder particle sim. Scripted inputs are a pure
+//! function of the step index (never RNG-derived) so a "replay" is just this
+//! function; `state_hash` is checked at fixed intervals across a long run.
 
-use floppy_core::clock::SIM_DT;
-use floppy_core::fixmath;
-use floppy_core::hash::hash_u32s;
 use floppy_core::input::InputState;
-use floppy_core::rng::Rng;
-use floppy_core::vec::Vec3;
+use floppy_core::physics::{LaunchParams, Stats, World};
 
-const NUM_PARTICLES: usize = 6;
-const BOX_HALF: f32 = 5.0;
-const STEPS: u32 = 600;
-
-struct Particle {
-    pos: Vec3,
-    vel: Vec3,
-}
-
-struct PlaceholderSim {
-    particles: [Particle; NUM_PARTICLES],
-}
-
-impl PlaceholderSim {
-    fn new(seed: u64) -> Self {
-        let mut rng = Rng::new(seed);
-        let particles = std::array::from_fn(|_| {
-            let pos = Vec3::new(
-                (rng.next_f32() - 0.5) * BOX_HALF,
-                (rng.next_f32() - 0.5) * BOX_HALF,
-                (rng.next_f32() - 0.5) * BOX_HALF,
-            );
-            let vel = Vec3::new(
-                (rng.next_f32() - 0.5) * 2.0,
-                (rng.next_f32() - 0.5) * 2.0,
-                (rng.next_f32() - 0.5) * 2.0,
-            );
-            Particle { pos, vel }
-        });
-        Self { particles }
-    }
-
-    /// One fixed 120 Hz step: apply an input-driven impulse to particle 0,
-    /// a fixmath-driven "wind" term to every particle, integrate, and bounce
-    /// off an axis-aligned box. Entities are iterated by fixed index order
-    /// only (SPEC §5) — no HashMap, no wall-clock.
-    fn step(&mut self, input: InputState) {
-        let impulse = Vec3::new(
-            input.dir_x as f32,
-            if input.hop { 1.0 } else { 0.0 },
-            input.dir_y as f32,
-        )
-        .scaled(0.3);
-
-        for (i, p) in self.particles.iter_mut().enumerate() {
-            if i == 0 {
-                p.vel = p.vel + impulse;
-            }
-            let wind = fixmath::sin(p.pos.x + p.pos.z) * 0.05;
-            p.vel.y -= (0.2 + wind) * SIM_DT;
-            p.pos = p.pos + p.vel.scaled(SIM_DT);
-
-            bounce(&mut p.pos.x, &mut p.vel.x);
-            bounce(&mut p.pos.y, &mut p.vel.y);
-            bounce(&mut p.pos.z, &mut p.vel.z);
-        }
-    }
-
-    fn state_hash(&self) -> u64 {
-        let mut words = Vec::with_capacity(NUM_PARTICLES * 6);
-        for p in &self.particles {
-            words.push(p.pos.x.to_bits());
-            words.push(p.pos.y.to_bits());
-            words.push(p.pos.z.to_bits());
-            words.push(p.vel.x.to_bits());
-            words.push(p.vel.y.to_bits());
-            words.push(p.vel.z.to_bits());
-        }
-        hash_u32s(&words)
+fn keystone_stats() -> Stats {
+    Stats {
+        atk: 52,
+        def: 54,
+        sta: 52,
+        wgt: 50,
+        spd: 50,
+        mtr: 44,
     }
 }
 
-fn bounce(pos: &mut f32, vel: &mut f32) {
-    if *pos > BOX_HALF {
-        *pos = BOX_HALF;
-        *vel = -*vel;
-    }
-    if *pos < -BOX_HALF {
-        *pos = -BOX_HALF;
-        *vel = -*vel;
-    }
-}
-
-/// A fixed, non-random scripted input sequence (a replay would be exactly
-/// this, decoded from `InputState::pack`/`unpack` — SPEC §6.4).
-fn scripted_input(step: u32) -> InputState {
-    let phase = step % 8;
-    InputState {
-        dir_x: match phase {
-            0..=2 => 1,
-            3..=5 => -1,
-            _ => 0,
+fn make_world(seed: u64) -> World {
+    let params = [
+        LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.6,
+            quality: 1.08,
+            spin_dir: 1,
+            stats: keystone_stats(),
         },
-        dir_y: if phase.is_multiple_of(2) { 1 } else { -1 },
-        hop: phase == 4,
-        ..Default::default()
-    }
+        LaunchParams {
+            heading: std::f32::consts::PI,
+            depth: 0.7,
+            power: 0.6,
+            quality: 1.08,
+            spin_dir: -1,
+            stats: keystone_stats(),
+        },
+    ];
+    World::launch(seed, params)
 }
 
-fn run(seed: u64) -> u64 {
-    let mut sim = PlaceholderSim::new(seed);
+/// Deterministic function of the step index only (SPEC §6.4 / task spec):
+/// `dir` cycles `-1, 0, 1` on a 40-step cadence, `dash` fires every 97th
+/// step for whichever top's index matches (alternating).
+fn scripted_inputs(step: u32) -> [InputState; 2] {
+    let phase = (step / 40) % 3;
+    let dir = match phase {
+        0 => -1,
+        1 => 0,
+        _ => 1,
+    };
+    let dash_now = step.is_multiple_of(97);
+    [
+        InputState {
+            dir_x: dir,
+            dir_y: -dir,
+            dash: dash_now,
+            ..Default::default()
+        },
+        InputState {
+            dir_x: -dir,
+            dir_y: dir,
+            dash: dash_now,
+            ..Default::default()
+        },
+    ]
+}
+
+const STEPS: u32 = 1200;
+const HASH_INTERVAL: u32 = 120;
+
+fn run_hash_sequence(seed: u64) -> Vec<u64> {
+    let mut world = make_world(seed);
+    let mut hashes = Vec::new();
     for s in 0..STEPS {
-        sim.step(scripted_input(s));
+        world.step(scripted_inputs(s));
+        if (s + 1) % HASH_INTERVAL == 0 {
+            hashes.push(world.state_hash());
+        }
     }
-    sim.state_hash()
+    hashes
 }
 
 #[test]
-fn same_seed_and_script_yields_identical_hash() {
-    let a = run(12345);
-    let b = run(12345);
+fn same_seed_and_script_yields_identical_hash_sequence() {
+    let a = run_hash_sequence(42);
+    let b = run_hash_sequence(42);
     assert_eq!(a, b);
+    // Sanity: a 1200-step scripted fight should actually produce more than
+    // one distinct hash (i.e. the world isn't frozen/degenerate).
+    assert!(
+        a.windows(2).any(|w| w[0] != w[1]),
+        "hashes never changed: {a:?}"
+    );
 }
 
 #[test]
-fn different_seed_diverges() {
-    let a = run(12345);
-    let b = run(54321);
+fn different_seed_diverges_or_matches_only_by_the_tiniest_chance() {
+    let a = run_hash_sequence(42);
+    let b = run_hash_sequence(1_000_003);
     assert_ne!(a, b);
+}
+
+#[test]
+fn cloned_world_stays_hash_identical_when_stepped_in_lockstep() {
+    let mut original = make_world(7);
+    // Advance partway into the fight before cloning, so the clone starts
+    // from genuinely "mid-fight" state (non-launch positions/velocities).
+    for s in 0..300u32 {
+        original.step(scripted_inputs(s));
+    }
+    let mut clone = original.clone();
+    assert_eq!(original.state_hash(), clone.state_hash());
+
+    for s in 300..600u32 {
+        let inputs = scripted_inputs(s);
+        original.step(inputs);
+        clone.step(inputs);
+        assert_eq!(
+            original.state_hash(),
+            clone.state_hash(),
+            "diverged at step {s}"
+        );
+    }
 }
