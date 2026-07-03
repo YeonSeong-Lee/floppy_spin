@@ -54,19 +54,6 @@ fn test_pixel(x: usize, y: usize, t: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-/// FNV-1a 64-bit hash. Duplicated here for this host-only verification tool;
-/// M1 moves this into `floppy_core` so every consumer shares one definition.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
 fn main() {
     let (frames, out_dir) = parse_args();
 
@@ -93,11 +80,7 @@ fn main() {
             std::process::exit(1);
         }
 
-        let mut serialized = Vec::with_capacity(framebuffer.len() * 4);
-        for &p in &framebuffer {
-            serialized.extend_from_slice(&p.to_le_bytes());
-        }
-        let hash = fnv1a64(&serialized);
+        let hash = floppy_core::hash::hash_u32s(&framebuffer);
         println!("frame {t:03} hash=0x{hash:016x}");
     }
 }
