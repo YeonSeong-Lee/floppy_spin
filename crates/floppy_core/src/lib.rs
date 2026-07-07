@@ -4,9 +4,12 @@
 
 pub mod arena;
 pub mod clock;
+pub mod combat;
 pub mod fixmath;
+pub mod flow;
 pub mod hash;
 pub mod input;
+pub mod minigame;
 pub mod physics;
 pub mod rng;
 pub mod roster;
