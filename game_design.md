@@ -35,7 +35,7 @@ Controls: arrows = camera-relative movement · **Space** = Dash · **Shift** = S
 
 | Verb | Type | Effect | Cost / risk |
 |---|---|---|---|
-| **Dash** (Space) | edge | +6 m/s impulse along input (additive, momentum & slope carry through), clamp 11 m/s. Startup 2, active 12, recovery 8, cooldown 48 steps (reduced by SPD). Hits during active: knockback ×1.4, drain ×1.25, shove-armor vs knockback < 2 m/s. One air-dash per airborne state. | cooldown-gated; committed forward hitbox, deflectable |
+| **Dash** (Space) | edge | +6 m/s impulse along input (additive, momentum & slope carry through), clamp 11 m/s. Startup 2, active 12, recovery 8, cooldown `72 − 0.4·SPD` steps (SPD 50 → 52). Hits during active: knockback ×1.4, drain ×1.25, shove-armor vs knockback < 2 m/s. One air-dash per airborne state. | cooldown-gated; committed forward hitbox, deflectable |
 | **Guard** (Z) | held | frontal-hemisphere barrier: incoming knockback ×0.25, drain ×0.35 — front 180° only. Startup 4, drop-recovery 6. **Parry**: hits in the first 8 steps of a press → knockback ×0, drain ×0.1, attacker staggered (instant tilt +0.12 rad), +12 meter. | drains 90 spin/s, move ×0.4; open from behind/above; slides downhill ×0.6 on slopes > 6° (turtling on the wall drifts toward ring-out) |
 | **Hop** (X) | edge | vertical impulse +4.5 m/s. Startup 3, de-penetration i-frames steps 4–12, land-lag 10 (vulnerable). Holding a direction in air = **aerial slam**: drain `250 + 8×fall_height_m` (cap 900), knockback likewise. Airborne: cannot Guard/Anchor; immune to ground-tracking effects. | 120 spin per hop; punishable landing |
 | **Carve** (C) | held | lean the spin axis into motion: top speed ×1.5, slope climb ×1.8 (the wall-ride verb), contact knockback ×1.35. Ramp-in 20 steps. | tilt +0.05 rad/s while held (decays over ~30 steps after release); over-carving topples **you** |
@@ -81,7 +81,7 @@ Six stats 0–100, preset budget 300±6 (no free lunch). BASE = 50 across the bo
 | DEF | drain taken ×`(1 − 0.6·DEF/100)`; knockback taken ×`(1 − 0.4·DEF/100)` |
 | STA | passive spin decay `34 − 20·STA/100` /s |
 | WGT | mass `20 + 0.6·WGT`; momentum exchange, ring-out resistance |
-| SPD | control accel `6 + 0.10·SPD` m/s²; dash cooldown `90 − 0.4·SPD` steps |
+| SPD | control accel `6 + 0.10·SPD` m/s²; dash cooldown `72 − 0.4·SPD` steps |
 | MTR | meter gain ×`(0.7 + 0.6·MTR/100)` |
 
 Derived: tilt-recovery torque ∝ WGT·STA (low both → topples early). Spin direction
