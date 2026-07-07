@@ -5,6 +5,7 @@ pub mod battle;
 pub mod camera;
 pub mod clip;
 pub mod frame;
+pub mod hud;
 pub mod mesh;
 pub mod raster;
 pub mod scene;
