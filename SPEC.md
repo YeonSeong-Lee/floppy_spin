@@ -140,7 +140,8 @@ Analytic heightfield `h(x, z)` (no grid): parabolic basin + concentric ridge rin
 (LUT-sin of radius) + gentle cross-hills (LUT-sin of x/z), with all features enveloped
 to zero approaching the rim so the outer wall is clean. Physics samples `h` and its
 analytic gradient for terrain normal; render tessellates the same function. Bowl radius
-~9.5 m, rim height ~3.2 m, steep wall from r ≈ 7 m. **Ring-out:** clearing rim height
+~9.5 m, rim height ~4.0 m (measured from the implemented formula at r = 9.5; the wall
+term 2.2·w³ dominates), steep wall from r ≈ 7 m. **Ring-out:** clearing rim height
 outside the bowl radius. **Stamina-out:** spin → 0, or topple (tilt magnitude past
 threshold while slow).
 
