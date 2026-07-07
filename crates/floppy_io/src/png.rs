@@ -194,8 +194,19 @@ pub fn decode_rgb(png: &[u8]) -> Result<(u32, u32, Vec<u32>), &'static str> {
 
     let raw = inflate_stored(&idat)?;
 
-    let stride = width as usize * 3;
-    let expected_len = (stride + 1) * height as usize;
+    // Checked arithmetic: a hostile IHDR can declare dimensions whose
+    // (3·w + 1)·h wraps around usize and collides with a tiny IDAT (M3
+    // verifier finding: a 132-byte file panicked the old unchecked multiply
+    // in debug and blew Vec::with_capacity in release). After the length
+    // equality check below, w·h < expected_len ≤ raw.len(), so the pixel
+    // allocation is bounded by data actually in memory.
+    let stride = (width as usize)
+        .checked_mul(3)
+        .ok_or("image dimensions overflow")?;
+    let expected_len = stride
+        .checked_add(1)
+        .and_then(|row| row.checked_mul(height as usize))
+        .ok_or("image dimensions overflow")?;
     if raw.len() != expected_len {
         return Err("decompressed size does not match width/height");
     }
@@ -344,6 +355,40 @@ mod tests {
     #[test]
     fn crc32_known_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// Rewrite a valid PNG's IHDR width/height and fix up the chunk CRC so
+    /// the decoder reaches its dimension arithmetic instead of bailing at
+    /// "bad CRC" — the attack surface the M3 verifier exercised.
+    fn patch_ihdr_dims(png: &mut [u8], width: u32, height: u32) {
+        // Layout: 8-byte signature, 4-byte len, "IHDR" at 12..16, 13 data
+        // bytes at 16..29 (w, h, depth, color, comp, filter, interlace),
+        // CRC over type+data (12..29) at 29..33.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn decode_rejects_overflowing_dimensions_without_panicking() {
+        // M3 verifier finding: (3·w + 1)·h wrapping around u64 used to panic
+        // the unchecked multiply (debug) or Vec::with_capacity (release).
+        // These exact dimensions made the wrapped product land on 64, the
+        // verifier's tiny-IDAT collision; the whole class must return Err.
+        let mut png = encode_rgb(1, 1, &[0x00FF_00FF]);
+        patch_ihdr_dims(&mut png, 1_431_743_149, 4_294_705_160);
+        assert!(decode_rgb(&png).is_err());
+
+        let mut png = encode_rgb(1, 1, &[0x00FF_00FF]);
+        patch_ihdr_dims(&mut png, u32::MAX, u32::MAX);
+        assert!(decode_rgb(&png).is_err());
+
+        // Sanity: the patch helper itself keeps a benign PNG decodable, so
+        // the Errs above come from the dimension checks, not a broken CRC.
+        let mut png = encode_rgb(1, 1, &[0x00FF_00FF]);
+        patch_ihdr_dims(&mut png, 1, 1);
+        assert!(decode_rgb(&png).is_ok());
     }
 
     #[test]

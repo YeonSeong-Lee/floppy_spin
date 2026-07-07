@@ -183,7 +183,10 @@ fn slope_slide_drifts_inward() {
     }
     let t = world.tops[0];
     let r_final = r_of(&t);
-    assert!(r_final < r0, "r_final={r_final} r0={r0}");
+    // Magnitude, not just sign (M3 verifier finding): the real slide covers
+    // ~2.8 m in these 100 steps, so requiring a full metre of drift keeps a
+    // regression to barely-measurable noise from passing silently.
+    assert!(r_final < r0 - 1.0, "r_final={r_final} r0={r0}");
 }
 
 #[test]
