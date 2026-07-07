@@ -143,13 +143,18 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
                         );
                     }
                     if let Some(outcome) = flow_state.last_outcome {
-                        hud::draw_banner(frame, flow::outcome_banner(outcome), 6, hud::COL_ICE);
+                        hud::draw_banner(
+                            frame,
+                            flow::outcome_banner(outcome, flow_state.last_round_end),
+                            6,
+                            hud::COL_ICE,
+                        );
                     }
                 }
                 MatchPhase::RoundResult => {
                     let line = flow_state
                         .last_outcome
-                        .map(flow::outcome_banner)
+                        .map(|o| flow::outcome_banner(o, flow_state.last_round_end))
                         .unwrap_or("ROUND OVER");
                     hud::draw_round_result(
                         frame,

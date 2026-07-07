@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use floppy_core::arena;
+use floppy_core::combat::{CombatState, SpecialId};
 use floppy_core::input::InputState;
 use floppy_core::physics::{LaunchParams, Stats, Top, World, TUNE};
 use floppy_core::rng::Rng;
@@ -116,6 +117,7 @@ fn build_battle_world() -> World {
             quality: 1.0,
             spin_dir: preset.spin_dir,
             stats: preset.stats,
+            special_id: SpecialId::from_silhouette(preset.silhouette),
         },
         LaunchParams {
             heading: std::f32::consts::PI,
@@ -124,6 +126,7 @@ fn build_battle_world() -> World {
             quality: 1.08,
             spin_dir: preset.spin_dir,
             stats: preset.stats,
+            special_id: SpecialId::from_silhouette(preset.silhouette),
         },
     ];
     World::launch(42, params)
@@ -186,6 +189,7 @@ fn top_at(
         dash_active,
         meter: 0.0,
         airdash_used: false,
+        combat: CombatState::default(),
     }
 }
 

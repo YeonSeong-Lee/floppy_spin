@@ -395,6 +395,7 @@ impl BattleScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floppy_core::combat::SpecialId;
     use floppy_core::fixmath;
     use floppy_core::physics::{LaunchParams, Stats};
     use floppy_core::roster::PRESETS;
@@ -527,6 +528,7 @@ mod tests {
                 quality: 1.0,
                 spin_dir: 1,
                 stats: keystone_stats(),
+                special_id: SpecialId::Overclock,
             },
             LaunchParams {
                 heading: std::f32::consts::PI,
@@ -535,6 +537,7 @@ mod tests {
                 quality: 1.08,
                 spin_dir: -1,
                 stats: keystone_stats(),
+                special_id: SpecialId::Overclock,
             },
         ];
         World::launch(42, params)

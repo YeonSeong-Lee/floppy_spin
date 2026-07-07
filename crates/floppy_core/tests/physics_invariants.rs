@@ -22,6 +22,7 @@
 //!     windows below need (verified empirically per test).
 
 use floppy_core::arena;
+use floppy_core::combat::{CombatState, SpecialId};
 use floppy_core::fixmath;
 use floppy_core::input::InputState;
 use floppy_core::physics::{BattleEvent, LaunchParams, Outcome, Stats, Top, World, TUNE};
@@ -56,6 +57,7 @@ fn make_top(pos: Vec3, vel: Vec3, spin: f32, spin_dir: i8, grounded: bool, stats
         dash_active: 0,
         meter: 0.0,
         airdash_used: false,
+        combat: CombatState::default(),
     }
 }
 
@@ -517,6 +519,7 @@ fn launch_quality_scales_spin_and_spawns_on_the_circle_and_grounds_out_passively
         quality,
         spin_dir: 1,
         stats: keystone_stats(),
+        special_id: SpecialId::Overclock,
     };
     let low = World::launch(10, [base_params(1.0), base_params(1.0)]);
     let high = World::launch(10, [base_params(1.2), base_params(1.2)]);
@@ -542,6 +545,7 @@ fn launch_quality_scales_spin_and_spawns_on_the_circle_and_grounds_out_passively
             quality: 1.08,
             spin_dir: -1,
             stats: keystone_stats(),
+            special_id: SpecialId::Overclock,
         },
         LaunchParams {
             heading: std::f32::consts::PI,
@@ -550,6 +554,7 @@ fn launch_quality_scales_spin_and_spawns_on_the_circle_and_grounds_out_passively
             quality: 1.08,
             spin_dir: -1,
             stats: keystone_stats(),
+            special_id: SpecialId::Overclock,
         },
     ];
     let mut world = World::launch(11, params);

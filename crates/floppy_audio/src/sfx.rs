@@ -511,6 +511,17 @@ pub fn on_event(mixer: &mut Mixer, ev: &floppy_core::physics::BattleEvent) {
         }
         BattleEvent::RingOut { .. } => play(mixer, Sfx::RingOutFall),
         BattleEvent::Topple { .. } => play(mixer, Sfx::ToppleWobble),
+        // M4-A additions (game_design.md §2/§3, task spec's explicit
+        // event->SFX mapping):
+        BattleEvent::Parry { .. } => play(mixer, Sfx::ParryTing),
+        BattleEvent::GuardBlock { .. } => play(mixer, Sfx::GuardClink),
+        BattleEvent::SpecialFire { .. } => play(mixer, Sfx::SpecialFire),
+        BattleEvent::CrashOut { .. } => play(mixer, Sfx::CrashOutSting),
+        BattleEvent::AerialSlam { .. } => play(mixer, Sfx::HitHeavy),
+        BattleEvent::SpecialHit { .. } => play(mixer, Sfx::HitHeavy),
+        // AnchorBreak is a state change (forced verb release), not an
+        // impact — no SFX (empty arm, deliberate per the task spec).
+        BattleEvent::AnchorBreak { .. } => {}
     }
 }
 

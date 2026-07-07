@@ -3,6 +3,7 @@
 //! function of the step index (never RNG-derived) so a "replay" is just this
 //! function; `state_hash` is checked at fixed intervals across a long run.
 
+use floppy_core::combat::SpecialId;
 use floppy_core::input::InputState;
 use floppy_core::physics::{LaunchParams, Stats, World};
 
@@ -26,6 +27,7 @@ fn make_world(seed: u64) -> World {
             quality: 1.08,
             spin_dir: 1,
             stats: keystone_stats(),
+            special_id: SpecialId::Overclock,
         },
         LaunchParams {
             heading: std::f32::consts::PI,
@@ -34,6 +36,7 @@ fn make_world(seed: u64) -> World {
             quality: 1.08,
             spin_dir: -1,
             stats: keystone_stats(),
+            special_id: SpecialId::Overclock,
         },
     ];
     World::launch(seed, params)

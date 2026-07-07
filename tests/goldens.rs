@@ -9,6 +9,7 @@
 //! checked-in PNGs after an intentional visual change.
 
 use floppy_core::arena;
+use floppy_core::combat::CombatState;
 use floppy_core::physics::{Stats, Top, World, TUNE};
 use floppy_core::rng::Rng;
 use floppy_core::roster::{Preset, Silhouette, PRESETS};
@@ -54,6 +55,7 @@ fn top_at(
         dash_active,
         meter: 0.0,
         airdash_used: false,
+        combat: CombatState::default(),
     }
 }
 

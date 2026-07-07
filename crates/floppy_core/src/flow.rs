@@ -39,6 +39,7 @@
 //! MatchOver → back to MainMenu. `Esc` arrives as a separate `bool` because
 //! `InputState` (SPEC §6.4) has no escape field.
 
+use crate::combat::SpecialId;
 use crate::input::InputState;
 use crate::minigame::{ai_roll, Difficulty, LaunchChoice, MinigameState};
 use crate::physics::{LaunchParams, Outcome, World};
@@ -277,25 +278,12 @@ pub struct FlowState {
     /// Points awarded for the decided round and to whom (None = draw).
     pub last_winner: Option<u8>,
     pub last_points: u8,
+    /// The Crash-Out/Over/Survivor/Draw classification of the decided
+    /// round, mirroring `last_winner`'s lifecycle exactly (SPEC §6.5).
+    pub last_round_end: Option<crate::combat::RoundEnd>,
     base_seed: u64,
     prev_input: InputState,
     prev_esc: bool,
-}
-
-/// Round points from an outcome (SPEC §6.5): Over (ring-out) 2 / Survivor
-/// (opponent stamina-out) 1 / simultaneous 0 and replay. Returns
-/// `(winner_index, points)`, `None` for a draw.
-///
-/// TODO(M4 integration): replace with `combat::round_points` once M4-A
-/// lands — the current `Outcome` enum cannot express the Crash-Out 3-point
-/// finish (kill inside the 144-step special window), so that path is
-/// unreachable until the combat layer extends the outcome/scoring surface.
-fn round_points_local(outcome: Outcome) -> Option<(u8, u8)> {
-    match outcome {
-        Outcome::RingOut { loser } => Some((1 - loser, 2)),
-        Outcome::StaminaOut { loser } => Some((1 - loser, 1)),
-        Outcome::Simultaneous => None,
-    }
 }
 
 /// Intro banner text as a pure function of the Intro frame counter (UI
@@ -314,11 +302,13 @@ pub fn intro_banner(frame: u32) -> &'static str {
     }
 }
 
-/// Outcome banner text (game_design.md §7 banner list).
-///
-/// TODO(M4 integration): add the "CRASH-OUT!!" banner once `combat` extends
-/// `Outcome` with the Crash-Out kill.
-pub fn outcome_banner(outcome: Outcome) -> &'static str {
+/// Outcome banner text (game_design.md §7 banner list): a Crash-Out kill
+/// (SPEC §6.5) always shows "CRASH-OUT!!" regardless of the underlying
+/// `Outcome`; otherwise the per-outcome mapping below applies.
+pub fn outcome_banner(outcome: Outcome, end: Option<crate::combat::RoundEnd>) -> &'static str {
+    if end == Some(crate::combat::RoundEnd::CrashOut) {
+        return "CRASH-OUT!!";
+    }
     match outcome {
         Outcome::RingOut { .. } => "RING OUT!",
         Outcome::StaminaOut { .. } => "TOPPLE!",
@@ -455,6 +445,7 @@ impl FlowState {
             last_outcome: None,
             last_winner: None,
             last_points: 0,
+            last_round_end: None,
             base_seed,
             prev_input: InputState::default(),
             prev_esc: false,
@@ -481,6 +472,7 @@ impl FlowState {
                 quality: 1.0,
                 spin_dir: self.minigame.spin_dir,
                 stats: p1_preset.stats,
+                special_id: SpecialId::from_silhouette(p1_preset.silhouette),
             },
             LaunchParams {
                 heading: wrap_tau(self.minigame.heading + PI),
@@ -489,6 +481,7 @@ impl FlowState {
                 quality: 1.0,
                 spin_dir: ai_preset.spin_dir,
                 stats: ai_preset.stats,
+                special_id: SpecialId::from_silhouette(ai_preset.silhouette),
             },
         ];
         World::launch(self.round_seed(), params)
@@ -513,6 +506,7 @@ impl FlowState {
         self.last_outcome = None;
         self.last_winner = None;
         self.last_points = 0;
+        self.last_round_end = None;
         self.begin_round();
     }
 
@@ -558,6 +552,7 @@ impl FlowState {
                 quality: choice.quality,
                 spin_dir: choice.spin_dir,
                 stats: PRESETS[self.p1_pick].stats,
+                special_id: SpecialId::from_silhouette(PRESETS[self.p1_pick].silhouette),
             },
             LaunchParams {
                 heading: wrap_tau(choice.heading + PI),
@@ -566,6 +561,7 @@ impl FlowState {
                 quality: ai_choice.quality,
                 spin_dir: ai_choice.spin_dir,
                 stats: PRESETS[self.ai_pick].stats,
+                special_id: SpecialId::from_silhouette(PRESETS[self.ai_pick].silhouette),
             },
         ];
         let mut world = World::launch(self.round_seed(), params);
@@ -725,16 +721,18 @@ impl FlowState {
                     }
                     if let Some(outcome) = world.outcome {
                         self.last_outcome = Some(outcome);
-                        match round_points_local(outcome) {
-                            Some((winner, pts)) => {
+                        match crate::combat::round_points(&world) {
+                            Some((winner, end)) => {
                                 self.score[winner as usize] =
-                                    self.score[winner as usize].saturating_add(pts);
+                                    self.score[winner as usize].saturating_add(end.points());
                                 self.last_winner = Some(winner);
-                                self.last_points = pts;
+                                self.last_points = end.points();
+                                self.last_round_end = Some(end);
                             }
                             None => {
                                 self.last_winner = None;
                                 self.last_points = 0;
+                                self.last_round_end = None;
                             }
                         }
                         next = Some(Screen::Match(MatchPhase::Decided));
@@ -817,19 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn round_points_match_spec_6_5() {
-        assert_eq!(
-            round_points_local(Outcome::RingOut { loser: 0 }),
-            Some((1, 2))
-        );
-        assert_eq!(
-            round_points_local(Outcome::StaminaOut { loser: 1 }),
-            Some((0, 1))
-        );
-        assert_eq!(round_points_local(Outcome::Simultaneous), None);
-    }
-
-    #[test]
     fn settings_cycles_wrap_in_both_directions() {
         assert_eq!(cycle_shake(ShakeLevel::Off, -1), ShakeLevel::High);
         assert_eq!(cycle_shake(ShakeLevel::High, 1), ShakeLevel::Off);
@@ -861,6 +846,7 @@ mod tests {
             quality: 1.0,
             spin_dir: 1,
             stats,
+            special_id: SpecialId::from_silhouette(PRESETS[3].silhouette),
         };
         let mut world = World::launch(1, [params, params]);
         world.tops[0].pos = crate::vec::Vec3::new(2.0, 0.0, 2.0);
