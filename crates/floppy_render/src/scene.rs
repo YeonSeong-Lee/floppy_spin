@@ -3,15 +3,20 @@
 //! project, cull backfaces, rasterize.
 //!
 //! Transform composition (documented, fixed order — SPEC §5 determinism):
-//! `world = offset + Rz(tilt.y) * Rx(tilt.x) * Ry(yaw) * local`, i.e. yaw
-//! around Y first, then tilt around X, then tilt around Z, then translate.
-//! Normals use the same three rotations (no translation).
+//! `world = offset + Rz(tilt.y) * Rx(tilt.x) * Ry(yaw) * Scale(radial,
+//! height, radial) * local`, i.e. a (possibly non-uniform, radius-vs-height)
+//! scale first, then yaw around Y, then tilt around X, then tilt around Z,
+//! then translate (M3-B: lets a body-of-revolution mesh be authored once at
+//! `radius = height = 1.0` and reused at any `Top::radius`/`Top::height`).
+//! Normals get the inverse-transpose of the scale (a diagonal matrix, so
+//! just the elementwise reciprocal) followed by the same three rotations (no
+//! translation), then are renormalized.
 
 use crate::camera::Camera;
 use crate::clip;
 use crate::frame::Frame;
 use crate::mesh::{self, Mesh};
-use crate::raster::{self, draw_tri, SVert};
+use crate::raster::{self, draw_tri, draw_tri_additive, SVert};
 use crate::shade::{self, Material};
 use floppy_core::fixmath;
 use floppy_core::vec::{Vec2, Vec3};
@@ -23,6 +28,13 @@ pub struct Instance<'a> {
     /// Axis tilt: rotation around X (`.x`) then around Z (`.y`), radians.
     pub tilt: Vec2,
     pub material: Material,
+    /// Local-space scale applied to the X/Z (radial) axes before rotation
+    /// (M3-B: a lathed mesh authored at `radius = 1.0` scaled to a top's
+    /// actual `radius`). `1.0` reproduces the mesh's authored geometry.
+    pub radial_scale: f32,
+    /// Local-space scale applied to the Y (height) axis before rotation.
+    /// `1.0` reproduces the mesh's authored geometry.
+    pub height_scale: f32,
 }
 
 fn rot_y(v: Vec3, angle: f32) -> Vec3 {
@@ -50,6 +62,24 @@ fn rotate(v: Vec3, yaw: f32, tilt: Vec2) -> Vec3 {
     rot_z(v, tilt.y)
 }
 
+/// Local-space (radial, height, radial) scale applied to a position before
+/// rotation (module docs).
+fn scale_pos(v: Vec3, radial: f32, height: f32) -> Vec3 {
+    Vec3::new(v.x * radial, v.y * height, v.z * radial)
+}
+
+/// Inverse-transpose of [`scale_pos`]'s diagonal scale matrix applied to a
+/// normal (elementwise reciprocal, since a diagonal matrix is its own
+/// transpose), renormalized. `radial`/`height` are floored to a small
+/// epsilon first so a degenerate `0.0` scale can never divide-by-zero into
+/// `NaN`/`inf` (module docs).
+fn scale_normal(n: Vec3, radial: f32, height: f32) -> Vec3 {
+    const MIN_SCALE: f32 = 1e-4;
+    let r = radial.max(MIN_SCALE);
+    let h = height.max(MIN_SCALE);
+    Vec3::new(n.x / r, n.y / h, n.z / r).normalize_or_zero()
+}
+
 /// Draw every triangle of `inst.mesh`, transformed by `inst`, through
 /// `cam`, into `frame`. Per triangle: transform + shade (world space) each
 /// vertex, near-clip in view space (colors already computed, so clipping
@@ -57,21 +87,68 @@ fn rotate(v: Vec3, yaw: f32, tilt: Vec2) -> Vec3 {
 /// triangle (`signed_area <= 0` — same convention/threshold `raster.rs`
 /// itself re-checks), then rasterize.
 pub fn draw_instance(frame: &mut Frame, cam: &Camera, inst: &Instance) {
+    draw_instance_impl(frame, cam, inst, |_local_idx| &inst.material, false);
+}
+
+/// Like [`draw_instance`], but draws with [`raster::draw_tri_additive`]
+/// (depth-tested, not depth-written, colors ADD onto the framebuffer) —
+/// M3-B / game_design.md §6's neon arena ring bands.
+pub fn draw_instance_additive(frame: &mut Frame, cam: &Camera, inst: &Instance) {
+    draw_instance_impl(frame, cam, inst, |_local_idx| &inst.material, true);
+}
+
+/// Like [`draw_instance`], but selects between `inst.material` and
+/// `alt_material` per vertex via `is_alt(local_vertex_index)` — the index
+/// into `inst.mesh.verts`/`norms` (M3-B / game_design.md §3/§6: a top's
+/// dark-metal body vs. its emissive accent flange, without needing a second
+/// overlapping mesh that would z-fight the first).
+pub fn draw_instance_split(
+    frame: &mut Frame,
+    cam: &Camera,
+    inst: &Instance,
+    alt_material: &Material,
+    is_alt: impl Fn(usize) -> bool,
+) {
+    draw_instance_impl(
+        frame,
+        cam,
+        inst,
+        |local_idx| {
+            if is_alt(local_idx) {
+                alt_material
+            } else {
+                &inst.material
+            }
+        },
+        false,
+    );
+}
+
+/// Shared per-triangle pipeline behind [`draw_instance`]/
+/// [`draw_instance_additive`]/[`draw_instance_split`]:
+/// `material_for(local_vertex_index)` resolves which `Material` shades each
+/// vertex; `additive` picks [`raster::draw_tri`] vs
+/// [`raster::draw_tri_additive`] for the final rasterize call.
+fn draw_instance_impl<'a>(
+    frame: &mut Frame,
+    cam: &Camera,
+    inst: &Instance,
+    material_for: impl Fn(usize) -> &'a Material,
+    additive: bool,
+) {
     for tri in &inst.mesh.tris {
         let mut world = [Vec3::default(); 3];
-        let mut world_n = [Vec3::default(); 3];
         let mut col = [Vec3::default(); 3];
 
         for i in 0..3 {
             let idx = tri[i] as usize;
-            let local = inst.mesh.verts[idx];
-            let local_n = inst.mesh.norms[idx];
+            let local = scale_pos(inst.mesh.verts[idx], inst.radial_scale, inst.height_scale);
+            let local_n = scale_normal(inst.mesh.norms[idx], inst.radial_scale, inst.height_scale);
             let w = rotate(local, inst.yaw, inst.tilt) + inst.offset;
             let wn = rotate(local_n, inst.yaw, inst.tilt);
             let view_dir = (cam.pos - w).normalize_or_zero();
             world[i] = w;
-            world_n[i] = wn;
-            col[i] = shade::shade(wn, view_dir, &inst.material);
+            col[i] = shade::shade(wn, view_dir, material_for(idx));
         }
 
         let view_tri = [
@@ -99,12 +176,14 @@ pub fn draw_instance(frame: &mut Frame, cam: &Camera, inst: &Instance) {
                 g: c.y,
                 b: c.z,
             };
-            draw_tri(
-                frame,
-                sv(x0, y0, z0, t[0].1),
-                sv(x1, y1, z1, t[1].1),
-                sv(x2, y2, z2, t[2].1),
-            );
+            let va = sv(x0, y0, z0, t[0].1);
+            let vb = sv(x1, y1, z1, t[1].1);
+            let vc = sv(x2, y2, z2, t[2].1);
+            if additive {
+                draw_tri_additive(frame, va, vb, vc);
+            } else {
+                draw_tri(frame, va, vb, vc);
+            }
         }
     }
 }
@@ -150,6 +229,8 @@ pub fn draw_test_scene(frame: &mut Frame, t: f32) {
         yaw: t * 8.0,
         tilt: Vec2::new(0.12 * fixmath::sin(t * 3.0), 0.0),
         material: top_material,
+        radial_scale: 1.0,
+        height_scale: 1.0,
     };
     draw_instance(frame, &cam, &top_instance);
 
@@ -173,6 +254,8 @@ pub fn draw_test_scene(frame: &mut Frame, t: f32) {
         yaw: 0.0,
         tilt: Vec2::new(0.0, 0.0),
         material: bowl_material,
+        radial_scale: 1.0,
+        height_scale: 1.0,
     };
     draw_instance(frame, &cam, &bowl_instance);
 }
@@ -230,6 +313,8 @@ mod tests {
             yaw: 0.0,
             tilt: Vec2::default(),
             material: flat_material(),
+            radial_scale: 1.0,
+            height_scale: 1.0,
         };
         let mut f = Frame::new(64, 64);
         draw_instance(&mut f, &cam, &front_inst);
@@ -247,6 +332,8 @@ mod tests {
             yaw: 0.0,
             tilt: Vec2::default(),
             material: flat_material(),
+            radial_scale: 1.0,
+            height_scale: 1.0,
         };
         let mut f2 = Frame::new(64, 64);
         draw_instance(&mut f2, &cam, &back_inst);
@@ -283,6 +370,8 @@ mod tests {
             yaw: 0.0,
             tilt: Vec2::default(),
             material: flat_material(),
+            radial_scale: 1.0,
+            height_scale: 1.0,
         };
         let mut f = Frame::new(64, 64);
         draw_instance(&mut f, &cam, &inst); // must not panic
@@ -321,10 +410,202 @@ mod tests {
             yaw: 0.0,
             tilt: Vec2::default(),
             material: flat_material(),
+            radial_scale: 1.0,
+            height_scale: 1.0,
         };
         let mut f = Frame::new(64, 64);
         draw_instance(&mut f, &cam, &inst);
         assert_eq!(painted_count(&f), 0);
+    }
+
+    #[test]
+    fn scale_pos_scales_radial_and_height_independently() {
+        let v = Vec3::new(2.0, 3.0, -1.0);
+        let s = scale_pos(v, 2.0, 5.0);
+        assert_eq!(s, Vec3::new(4.0, 15.0, -2.0));
+    }
+
+    #[test]
+    fn scale_normal_keeps_direction_under_uniform_scale() {
+        // A uniform (radial == height) scale doesn't skew the surface, so
+        // the reciprocal-then-renormalize transform should reproduce the
+        // same direction it started with.
+        let n = Vec3::new(0.6, 0.8, 0.0); // already unit length
+        let s = scale_normal(n, 2.0, 2.0);
+        assert!((s.x - n.x).abs() < 1e-5, "s={s:?}");
+        assert!((s.y - n.y).abs() < 1e-5, "s={s:?}");
+        assert!((s.length() - 1.0).abs() < 1e-5, "len={}", s.length());
+    }
+
+    #[test]
+    fn scale_normal_never_produces_non_finite_output_on_degenerate_scale() {
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let s = scale_normal(n, 0.0, 0.0);
+        assert!(
+            s.x.is_finite() && s.y.is_finite() && s.z.is_finite(),
+            "s={s:?}"
+        );
+    }
+
+    #[test]
+    fn draw_instance_radial_scale_grows_the_painted_footprint() {
+        let cam = Camera::look_at(
+            Vec3::new(0.0, 0.0, -5.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            60.0,
+            64,
+            64,
+        );
+        let front_mesh = flat_tri_mesh([0, 1, 2]);
+        let base_inst = Instance {
+            mesh: &front_mesh,
+            offset: Vec3::default(),
+            yaw: 0.0,
+            tilt: Vec2::default(),
+            material: flat_material(),
+            radial_scale: 1.0,
+            height_scale: 1.0,
+        };
+        let mut f_base = Frame::new(64, 64);
+        draw_instance(&mut f_base, &cam, &base_inst);
+        let base_count = painted_count(&f_base);
+
+        let scaled_inst = Instance {
+            radial_scale: 1.6,
+            height_scale: 1.6,
+            ..base_inst
+        };
+        let mut f_scaled = Frame::new(64, 64);
+        draw_instance(&mut f_scaled, &cam, &scaled_inst);
+        let scaled_count = painted_count(&f_scaled);
+
+        assert!(
+            scaled_count > base_count,
+            "base_count={base_count} scaled_count={scaled_count}"
+        );
+    }
+
+    /// Two independent (non-adjacent) triangles, left and right, sharing no
+    /// vertices — so `draw_instance_split`'s per-vertex-index material
+    /// selection can be pinned to one triangle without touching the other.
+    fn split_test_mesh() -> Mesh {
+        Mesh {
+            verts: vec![
+                // Left triangle: indices 0,1,2 (base material).
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                Vec3::new(-0.5, 1.0, 0.0),
+                // Right triangle: indices 3,4,5 (alt material).
+                Vec3::new(0.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(0.5, 1.0, 0.0),
+            ],
+            norms: vec![Vec3::new(0.0, 0.0, -1.0); 6],
+            tris: vec![[0, 1, 2], [3, 4, 5]],
+        }
+    }
+
+    #[test]
+    fn draw_instance_split_uses_alt_material_only_for_selected_vertices() {
+        let cam = Camera::look_at(
+            Vec3::new(0.0, 0.0, -5.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            60.0,
+            64,
+            64,
+        );
+        let mesh = split_test_mesh();
+        // Base material: pure black under this lighting (base=0 -> the
+        // ambient/diffuse term multiplies to 0, no emissive, no spec) so it
+        // is indistinguishable from the cleared background — exactly the
+        // point: only the alt (right) triangle should show any color.
+        let base_material = Material {
+            base: Vec3::new(0.0, 0.0, 0.0),
+            emissive: Vec3::new(0.0, 0.0, 0.0),
+            spec_power_i: 1,
+            spec_strength: 0.0,
+        };
+        let alt_material = Material {
+            base: Vec3::new(0.0, 0.0, 0.0),
+            emissive: Vec3::new(1.0, 0.0, 0.0),
+            spec_power_i: 1,
+            spec_strength: 0.0,
+        };
+        let inst = Instance {
+            mesh: &mesh,
+            offset: Vec3::default(),
+            yaw: 0.0,
+            tilt: Vec2::default(),
+            material: base_material,
+            radial_scale: 1.0,
+            height_scale: 1.0,
+        };
+        let mut f = Frame::new(64, 64);
+        // Vertex indices 3,4,5 (the right triangle) get the alt material.
+        draw_instance_split(&mut f, &cam, &inst, &alt_material, |idx| idx >= 3);
+
+        let mut red_xs = Vec::new();
+        for y in 0..64 {
+            for x in 0..64 {
+                let p = f.px[y * 64 + x];
+                if (p >> 16) & 0xFF == 255 {
+                    red_xs.push(x);
+                }
+            }
+        }
+        assert!(!red_xs.is_empty(), "expected some red (alt) pixels");
+        // camera.rs's LEFT-handed basis (`right = fwd x world_up`) means
+        // world +x (the alt/right triangle, indices 3,4,5) projects to the
+        // SMALLER screen-x half, not the larger one — empirically confirmed
+        // here rather than assumed, matching the same handedness quirk
+        // `mesh.rs`'s module docs call out for triangle winding.
+        assert!(
+            red_xs.iter().all(|&x| x < 32),
+            "alt-material pixels leaked into the base-material half: {red_xs:?}"
+        );
+    }
+
+    #[test]
+    fn draw_instance_additive_adds_onto_existing_pixels_and_writes_no_depth() {
+        let cam = Camera::look_at(
+            Vec3::new(0.0, 0.0, -5.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            60.0,
+            64,
+            64,
+        );
+        let front_mesh = flat_tri_mesh([0, 1, 2]);
+        let material = Material {
+            base: Vec3::new(0.0, 0.0, 0.0),
+            emissive: Vec3::new(50.0 / 255.0, 0.0, 0.0),
+            spec_power_i: 1,
+            spec_strength: 0.0,
+        };
+        let inst = Instance {
+            mesh: &front_mesh,
+            offset: Vec3::default(),
+            yaw: 0.0,
+            tilt: Vec2::default(),
+            material,
+            radial_scale: 1.0,
+            height_scale: 1.0,
+        };
+        let mut f = Frame::new(64, 64);
+        draw_instance_additive(&mut f, &cam, &inst);
+        draw_instance_additive(&mut f, &cam, &inst);
+        // Two additive passes at the same low value must sum (not
+        // overwrite): distinguishable from a single pass, matching
+        // `raster::tests::fill_rule_covers_every_pixel_exactly_once`'s
+        // "doubling-detectable value" approach.
+        let any_doubled =
+            f.px.iter()
+                .any(|&p| (98..=102).contains(&((p >> 16) & 0xFF)));
+        assert!(any_doubled, "expected additive passes to sum");
+        // No depth written: every depth entry stays at the cleared 0.0.
+        assert!(
+            f.depth.iter().all(|&d| d == 0.0),
+            "additive must not write depth"
+        );
     }
 
     #[test]

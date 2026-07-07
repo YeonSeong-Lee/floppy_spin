@@ -19,8 +19,13 @@ pub const SIM_DT: f32 = crate::clock::SIM_DT;
 /// Vertical offset from the tracked "tip/contact" point ([`Top::pos`]) up to
 /// the sphere used for top-vs-top collision. Not exposed as a `TuneParams`
 /// field because it's a body-shape constant (SPEC §6.1: `radius`/`height`),
-/// not a tunable feel knob.
-const BODY_CENTER_OFFSET: f32 = 0.35;
+/// not a tunable feel knob. M3-B (game_design.md §3/§6): scaled from 0.35 to
+/// 0.7 alongside the `radius`/`height` bump below so silhouettes read at
+/// 60-100 px under the fixed whole-arena camera.
+const BODY_CENTER_OFFSET: f32 = 0.7;
+
+/// Full turn, radians (M3-B `spin_angle` wrap).
+const TAU: f32 = std::f32::consts::TAU;
 
 /// Magnitudes below this snap to exactly `0.0` every step (SPEC "HARD
 /// RULES": denormal guard).
@@ -115,6 +120,14 @@ pub struct TuneParams {
     pub launch_speed_depth: f32,
     pub launch_spin_base: f32,
     pub launch_spin_power: f32,
+
+    /// Visual-only accumulated spin angle rate, radians per spin-unit-second
+    /// (M3-B / game_design.md §6): `spin_angle += spin * spin_angle_rate *
+    /// spin_dir * SIM_DT` each step. Not a physics quantity — nothing reads
+    /// it back into forces/collisions — purely the render's rotation state
+    /// (see [`pose_lerp`]). Tuned so the apparent (aliased at 60 fps) motion
+    /// reads as authentic spinning-top shimmer rather than a strobing blur.
+    pub spin_angle_rate: f32,
 }
 
 /// Starting tuning values (task spec table). See the final report for any
@@ -170,6 +183,8 @@ pub const TUNE: TuneParams = TuneParams {
     launch_speed_depth: 5.0,
     launch_spin_base: 7_000.0,
     launch_spin_power: 2_000.0,
+
+    spin_angle_rate: 0.045,
 };
 
 /// Six 0..=100 stats (game_design.md §3). Methods return the derived sim
@@ -245,6 +260,11 @@ pub struct Top {
     pub spin_dir: i8,
     pub tilt: Vec2,
     pub tilt_phase: f32,
+    /// Real accumulated visual rotation angle around the spin axis, radians,
+    /// wrapped into `[0, 2*pi)` (M3-B / game_design.md §6). Sim-frozen during
+    /// hitstop like everything else in the step body; render-only, never fed
+    /// back into physics.
+    pub spin_angle: f32,
     pub radius: f32,
     pub height: f32,
     pub stats: Stats,
@@ -258,6 +278,49 @@ pub struct Top {
 impl Top {
     fn spin_frac(&self) -> f32 {
         (self.spin / TUNE.spin_max).clamp(0.0, 1.0)
+    }
+}
+
+/// Render-ready interpolated snapshot of one top (SPEC §5: rendering blends
+/// the two most recent 120 Hz sim states by `alpha`). `radius`/`height` are
+/// body-shape constants, not "previous vs current" state, so they're just
+/// carried from `curr`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TopPose {
+    pub pos: Vec3,
+    pub tilt: Vec2,
+    pub spin_angle: f32,
+    pub radius: f32,
+    pub height: f32,
+}
+
+/// Interpolate `prev` -> `curr` by `alpha` (clamped to `[0, 1]`) for one top.
+/// `pos`/`tilt` lerp linearly. `spin_angle` lerps along the SHORTEST arc
+/// around the `[0, 2*pi)` wrap: naively lerping the raw wrapped values would
+/// animate a near-`0`/near-`2*pi` pair as one all-the-way-around revolution
+/// backwards instead of the one small step it actually is.
+pub fn pose_lerp(prev: &Top, curr: &Top, alpha: f32) -> TopPose {
+    let alpha = alpha.clamp(0.0, 1.0);
+
+    let mut diff = curr.spin_angle - prev.spin_angle;
+    if diff > TAU * 0.5 {
+        diff -= TAU;
+    } else if diff < -TAU * 0.5 {
+        diff += TAU;
+    }
+    let mut spin_angle = prev.spin_angle + diff * alpha;
+    if spin_angle >= TAU {
+        spin_angle -= TAU;
+    } else if spin_angle < 0.0 {
+        spin_angle += TAU;
+    }
+
+    TopPose {
+        pos: prev.pos.lerp(curr.pos, alpha),
+        tilt: prev.tilt.lerp(curr.tilt, alpha),
+        spin_angle,
+        radius: curr.radius,
+        height: curr.height,
     }
 }
 
@@ -344,8 +407,9 @@ fn spawn_launch_top(p: &LaunchParams) -> Top {
         spin_dir: p.spin_dir,
         tilt: Vec2::default(),
         tilt_phase: 0.0,
-        radius: 0.45,
-        height: 0.5,
+        spin_angle: 0.0,
+        radius: 0.95,
+        height: 1.0,
         stats: p.stats,
         grounded: false,
         dash_cd: 0,
@@ -590,6 +654,21 @@ impl World {
         }
         top.spin = top.spin.clamp(0.0, TUNE.spin_max);
 
+        // Visual-only accumulated spin angle (M3-B): NOT fed back into
+        // physics, purely render state (see `pose_lerp`). Wrapped by branch
+        // (never `.fract()`, which the no-libm scan bans outside fixmath.rs)
+        // into `[0, 2*pi)`. A single subtract/add suffices because the
+        // per-step increment magnitude (`spin_max * spin_angle_rate * SIM_DT`
+        // ~= 3.75 rad) never reaches `TAU` (~6.28), so the previous
+        // already-wrapped value plus one step's delta can cross the `[0,
+        // TAU)` boundary at most once in either direction.
+        top.spin_angle += top.spin * TUNE.spin_angle_rate * top.spin_dir as f32 * SIM_DT;
+        if top.spin_angle >= TAU {
+            top.spin_angle -= TAU;
+        } else if top.spin_angle < 0.0 {
+            top.spin_angle += TAU;
+        }
+
         let spin_frac = top.spin_frac();
         let one_minus = 1.0 - spin_frac;
         let wobble_freq = TUNE.wobble_freq_base + TUNE.wobble_freq_growth * one_minus;
@@ -802,6 +881,7 @@ impl World {
                 spin_dir,
                 tilt,
                 tilt_phase,
+                spin_angle,
                 radius,
                 height,
                 stats,
@@ -830,6 +910,7 @@ impl World {
             words.push(tilt.x.to_bits());
             words.push(tilt.y.to_bits());
             words.push(tilt_phase.to_bits());
+            words.push(spin_angle.to_bits());
             words.push(radius.to_bits());
             words.push(height.to_bits());
             words.push(atk as u32);
@@ -955,8 +1036,9 @@ mod tests {
                     spin_dir: 1,
                     tilt: Vec2::default(),
                     tilt_phase: 0.0,
-                    radius: 0.45,
-                    height: 0.5,
+                    spin_angle: 0.0,
+                    radius: 0.95,
+                    height: 1.0,
                     stats,
                     grounded: false,
                     dash_cd: 0,
@@ -971,8 +1053,9 @@ mod tests {
                     spin_dir: 1,
                     tilt: Vec2::default(),
                     tilt_phase: 0.0,
-                    radius: 0.45,
-                    height: 0.5,
+                    spin_angle: 0.0,
+                    radius: 0.95,
+                    height: 1.0,
                     stats,
                     grounded: false,
                     dash_cd: 0,
@@ -996,5 +1079,142 @@ mod tests {
             assert_eq!(before, world.tops, "state changed during hitstop skip");
         }
         assert_eq!(world.hitstop, 0);
+    }
+
+    #[test]
+    fn spin_angle_accumulates_and_wraps_into_zero_tau_range() {
+        let params = LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.5,
+            quality: 1.0,
+            spin_dir: 1,
+            stats: keystone_stats(),
+        };
+        let mut world = World::launch(1, [params, params]);
+        assert_eq!(world.tops[0].spin_angle, 0.0, "launch spawns spin_angle=0");
+
+        let mut prev_angle = world.tops[0].spin_angle;
+        let mut saw_wrap = false;
+        for _ in 0..2000 {
+            world.step([InputState::default(), InputState::default()]);
+            for top in &world.tops {
+                assert!(
+                    (0.0..TAU).contains(&top.spin_angle),
+                    "spin_angle escaped [0, TAU): {}",
+                    top.spin_angle
+                );
+            }
+            let a = world.tops[0].spin_angle;
+            if a < prev_angle {
+                saw_wrap = true;
+            }
+            prev_angle = a;
+        }
+        assert!(
+            saw_wrap,
+            "expected spin_angle to wrap at least once over 2000 steps"
+        );
+    }
+
+    #[test]
+    fn spin_angle_decreases_for_negative_spin_dir() {
+        let params_pos = LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.5,
+            quality: 1.0,
+            spin_dir: -1,
+            stats: keystone_stats(),
+        };
+        let mut world = World::launch(1, [params_pos, params_pos]);
+        world.step([InputState::default(), InputState::default()]);
+        // spin_dir=-1: the raw angle moves negative, then wraps up toward
+        // TAU rather than staying near 0 (verifies the underflow branch).
+        assert!(
+            world.tops[0].spin_angle > TAU * 0.5,
+            "spin_angle={}",
+            world.tops[0].spin_angle
+        );
+    }
+
+    #[test]
+    fn pose_lerp_endpoints_match_prev_and_curr() {
+        let mut prev = spawn_launch_top(&LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.5,
+            quality: 1.0,
+            spin_dir: 1,
+            stats: keystone_stats(),
+        });
+        prev.pos = Vec3::new(0.0, 0.0, 0.0);
+        prev.spin_angle = 1.0;
+        let mut curr = prev;
+        curr.pos = Vec3::new(1.0, 2.0, 3.0);
+        curr.tilt = Vec2::new(0.2, -0.1);
+        curr.spin_angle = 2.0;
+
+        let at0 = pose_lerp(&prev, &curr, 0.0);
+        assert_eq!(at0.pos, prev.pos);
+        assert_eq!(at0.tilt, prev.tilt);
+        assert!((at0.spin_angle - 1.0).abs() < 1e-6);
+
+        let at1 = pose_lerp(&prev, &curr, 1.0);
+        assert_eq!(at1.pos, curr.pos);
+        assert_eq!(at1.tilt, curr.tilt);
+        assert!((at1.spin_angle - 2.0).abs() < 1e-6);
+
+        let mid = pose_lerp(&prev, &curr, 0.5);
+        assert!((mid.pos.x - 0.5).abs() < 1e-6);
+        assert!((mid.spin_angle - 1.5).abs() < 1e-6);
+        assert_eq!(mid.radius, curr.radius);
+        assert_eq!(mid.height, curr.height);
+    }
+
+    #[test]
+    fn pose_lerp_spin_angle_takes_the_shortest_arc_across_the_wrap() {
+        let mut prev = spawn_launch_top(&LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.5,
+            quality: 1.0,
+            spin_dir: 1,
+            stats: keystone_stats(),
+        });
+        // prev near TAU, curr just past the wrap (near 0): the true motion is
+        // a tiny forward step, NOT a near-full revolution backward.
+        prev.spin_angle = TAU - 0.1;
+        let mut curr = prev;
+        curr.spin_angle = 0.05;
+
+        let mid = pose_lerp(&prev, &curr, 0.5);
+        // Naive lerp (no wrap-awareness) would give ~ (TAU-0.1 + 0.05)/2 ~=
+        // TAU/2, near pi — the wrong direction entirely. The correct
+        // shortest-arc midpoint is near TAU (equivalently just under 0).
+        let dist_to_zero = mid.spin_angle.min(TAU - mid.spin_angle);
+        assert!(
+            dist_to_zero < 0.1,
+            "expected midpoint near the 0/TAU wrap, got {}",
+            mid.spin_angle
+        );
+    }
+
+    #[test]
+    fn pose_lerp_clamps_alpha_outside_zero_one() {
+        let prev = spawn_launch_top(&LaunchParams {
+            heading: 0.0,
+            depth: 0.7,
+            power: 0.5,
+            quality: 1.0,
+            spin_dir: 1,
+            stats: keystone_stats(),
+        });
+        let mut curr = prev;
+        curr.pos = Vec3::new(5.0, 5.0, 5.0);
+        let below = pose_lerp(&prev, &curr, -1.0);
+        let above = pose_lerp(&prev, &curr, 2.0);
+        assert_eq!(below.pos, prev.pos);
+        assert_eq!(above.pos, curr.pos);
     }
 }

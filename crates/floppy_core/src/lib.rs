@@ -9,4 +9,5 @@ pub mod hash;
 pub mod input;
 pub mod physics;
 pub mod rng;
+pub mod roster;
 pub mod vec;

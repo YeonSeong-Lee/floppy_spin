@@ -47,8 +47,9 @@ fn make_top(pos: Vec3, vel: Vec3, spin: f32, spin_dir: i8, grounded: bool, stats
         spin_dir,
         tilt: Vec2::default(),
         tilt_phase: 0.0,
-        radius: 0.45,
-        height: 0.5,
+        spin_angle: 0.0,
+        radius: 0.95,
+        height: 1.0,
         stats,
         grounded,
         dash_cd: 0,
@@ -166,7 +167,18 @@ fn slope_slide_drifts_inward() {
         keystone_stats(),
     );
     let mut world = world_with(top0, corner_dummy());
-    for _ in 0..300 {
+    // M3-B (body radius 0.45->0.95, BODY_CENTER_OFFSET 0.35->0.7): the
+    // collision sphere sum-radius roughly doubled, so `corner_dummy`'s old
+    // 300-step window is no longer collision-safe — it lands (~step 115) and
+    // rolls inward fast enough down the steep wall slope to reach top0's
+    // path before step 300, corrupting `r_final` with a knockback. While
+    // still airborne, though, `corner_dummy` has exactly zero horizontal
+    // velocity (see its own doc comment) so its (x, z) never moves — only
+    // `y` falls — keeping its horizontal (and therefore 3D sphere-sphere)
+    // distance to top0 fixed at ~12.5 m, far past any plausible sum-radius.
+    // 100 steps stays safely inside that "still falling" window while still
+    // giving top0's slope-slide plenty of time to show measurable drift.
+    for _ in 0..100 {
         world.step(NO_INPUT);
     }
     let t = world.tops[0];
