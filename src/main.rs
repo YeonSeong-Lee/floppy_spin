@@ -20,7 +20,7 @@ use floppy_render::frame::Frame;
 use floppy_render::particles::{self, ParticlePool};
 use floppy_render::post::PostState;
 use floppy_render::{hud, vfx};
-use platform::win32::{self, Platform, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
+use platform::win32::{self, Platform, WindowScaleMode, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
 const H: usize = 540;
@@ -633,6 +633,18 @@ fn render(
 // Audio wiring (Task M6-B; SPEC §8, game_design.md §8).
 // ---------------------------------------------------------------------------
 
+/// `flow::WindowScale` (SPEC §7 setting, persisted) -> the platform layer's
+/// own `WindowScaleMode` (kept a distinct type so `win32` doesn't depend on
+/// `floppy_core::flow` — module docs on `WindowScaleMode`).
+fn window_scale_mode_for(scale: flow::WindowScale) -> WindowScaleMode {
+    match scale {
+        flow::WindowScale::X1 => WindowScaleMode::X1,
+        flow::WindowScale::X1_5 => WindowScaleMode::X1_5,
+        flow::WindowScale::X2 => WindowScaleMode::X2,
+        flow::WindowScale::Fullscreen => WindowScaleMode::Fullscreen,
+    }
+}
+
 /// Which song plays for a given screen: every match phase (Intro/Launch/
 /// Fight/Decided/RoundResult) uses the battle theme — including the
 /// cosmetic-preview Intro/Launch phases, so the riser builds tension into
@@ -720,6 +732,13 @@ fn main() {
     // no branching needed here.
     flow_state.apply_save(save::decode(&win32::save_load()));
 
+    // ---- Window-scale (SPEC §7): apply the now-loaded setting once at
+    // boot, so a persisted non-default scale takes effect immediately
+    // instead of only after the player revisits Settings. `set_window_scale`
+    // itself no-ops if the mode already matches `Platform::init`'s starting
+    // X1, so this is cheap on the (default) common case.
+    platform.set_window_scale(window_scale_mode_for(flow_state.settings.window_scale));
+
     // Fixed-timestep pump (SPEC §5): the SimClock banks wall time into whole
     // 120 Hz steps; every SIM_STEPS_PER_FLOW_FRAME (2) banked steps run one
     // flow frame (which itself steps the World/minigame twice during
@@ -773,6 +792,16 @@ fn main() {
             {
                 let (parts, settings) = flow_state.save_snapshot();
                 win32::save_store(&save::encode(parts, &settings));
+            }
+
+            // ---- Window-scale (SPEC §7): re-apply on the same "leaving
+            // Settings" edge as the persist write just above — the only
+            // screen where `window_scale` can change. `set_window_scale`
+            // itself no-ops when the mode is unchanged, so this never
+            // thrashes the window if the player left Settings without
+            // touching that row.
+            if prev_nav.screen != flow_state.screen && matches!(prev_nav.screen, Screen::Settings) {
+                platform.set_window_scale(window_scale_mode_for(flow_state.settings.window_scale));
             }
 
             // ---- Music: replace the Tracker wholesale on a song switch.

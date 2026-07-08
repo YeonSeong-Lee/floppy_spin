@@ -35,6 +35,10 @@ type LONG = i32;
 type BOOL = i32;
 type LPCWSTR = *const u16;
 type LPVOID = *mut c_void;
+/// `LONG_PTR`: pointer-sized signed integer, i.e. `isize` on the x86_64 ABI
+/// this project targets (SPEC C2) — used only by `Get/SetWindowLongPtrW`'s
+/// `GWL_STYLE` value below.
+type LONG_PTR = isize;
 
 // ---- waveOut (Task M6-B) ---------------------------------------------------
 /// Opaque waveOut device handle.
@@ -137,8 +141,19 @@ const CS_HREDRAW: UINT = 0x0002;
 const CS_OWNDC: UINT = 0x0020;
 
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF_0000;
+const WS_POPUP: DWORD = 0x8000_0000;
+const WS_VISIBLE: DWORD = 0x1000_0000;
 
 const SW_SHOW: i32 = 5;
+
+// ---- window-scale resize (SPEC §7: "window scale (1x/1.5x/2x/borderless-
+// fullscreen; internal resolution is always 960x540)") -----------------------
+
+const GWL_STYLE: i32 = -16;
+const HWND_TOP: HWND = ptr::null_mut(); // HWND_TOP == 0
+const SWP_NOZORDER: UINT = 0x0004;
+const SWP_FRAMECHANGED: UINT = 0x0020;
+const SWP_SHOWWINDOW: UINT = 0x0040;
 
 const PM_REMOVE: UINT = 0x0001;
 
@@ -221,6 +236,19 @@ extern "system" {
     fn ValidateRect(hWnd: HWND, lpRect: *const RECT) -> BOOL;
     fn GetSystemMetrics(nIndex: i32) -> i32;
     fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) -> HCURSOR;
+    // ---- window-scale resize (SPEC §7) ----
+    #[allow(clippy::too_many_arguments)]
+    fn SetWindowPos(
+        hWnd: HWND,
+        hWndInsertAfter: HWND,
+        X: i32,
+        Y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: UINT,
+    ) -> BOOL;
+    fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> LONG_PTR;
+    fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: LONG_PTR) -> LONG_PTR;
 }
 
 #[link(name = "gdi32")]
@@ -504,6 +532,31 @@ impl AudioRing {
 }
 
 // ---------------------------------------------------------------------------
+// Window-scale resize (SPEC §7: "window scale (1x/1.5x/2x/borderless-
+// fullscreen; internal resolution is always 960x540)"). Purely a WINDOW
+// sizing concern — the internal render buffer stays 960x540 always; `blit`'s
+// `StretchDIBits` (already `SetStretchBltMode(COLORONCOLOR)`) is what scales
+// that fixed framebuffer up to whatever the client area ends up being, so
+// nothing here touches the sim or the render buffer.
+// ---------------------------------------------------------------------------
+
+/// Platform-layer window-scale mode (deliberately not `floppy_core::flow`'s
+/// `WindowScale` — this module must not depend on `floppy_core`; `main.rs`
+/// maps one to the other).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowScaleMode {
+    X1,
+    X1_5,
+    X2,
+    Fullscreen,
+}
+
+/// Internal render resolution (SPEC §7), used to compute the client size for
+/// each windowed scale tier.
+const BASE_W: i32 = 960;
+const BASE_H: i32 = 540;
+
+// ---------------------------------------------------------------------------
 // Public safe API.
 // ---------------------------------------------------------------------------
 
@@ -517,6 +570,10 @@ pub struct Platform {
     quit: bool,
     qpc_freq: f64,
     audio: AudioRing,
+    /// Last-applied window-scale mode, so re-applying the same mode every
+    /// time the settings screen is exited (even with no change) is a cheap
+    /// no-op instead of thrashing the window (task brief).
+    window_scale: WindowScaleMode,
 }
 
 impl Platform {
@@ -595,6 +652,12 @@ impl Platform {
                 quit: false,
                 qpc_freq: freq as f64,
                 audio: AudioRing::closed(),
+                // `init`'s window is always created windowed at exactly
+                // `client_w`x`client_h`, which is the X1 (960x540) case for
+                // every current caller (`main.rs`) — kept as the starting
+                // point so a boot-time `set_window_scale(X1)` call is
+                // correctly recognized as a no-op.
+                window_scale: WindowScaleMode::X1,
             }
         }
     }
@@ -689,6 +752,95 @@ impl Platform {
                 SRCCOPY,
             );
         }
+    }
+
+    /// Applies a window-scale mode (SPEC §7): resizes/restyles the WINDOW
+    /// only — the internal 960x540 render buffer never changes, and neither
+    /// does `blit`'s `StretchDIBits` call, which already stretches whatever
+    /// the client rect turns out to be. A no-op if `mode` is already the
+    /// current mode (so calling this on every settings-exit, or once at
+    /// boot with the default X1, never thrashes the window), and a silent
+    /// no-op on any FFI failure — a botched resize must never crash the game
+    /// (mirrors the waveOut graceful-degradation posture elsewhere in this
+    /// file).
+    pub fn set_window_scale(&mut self, mode: WindowScaleMode) {
+        if mode == self.window_scale {
+            return;
+        }
+        if self.hwnd.is_null() {
+            return;
+        }
+
+        unsafe {
+            // Read the current style so the (comparatively heavier, and
+            // SWP_FRAMECHANGED-requiring) SetWindowLongPtrW call only
+            // happens when the target style actually differs from the
+            // current one, rather than unconditionally on every call.
+            let current_style = GetWindowLongPtrW(self.hwnd, GWL_STYLE) as DWORD;
+
+            match mode {
+                WindowScaleMode::Fullscreen => {
+                    let style = WS_POPUP | WS_VISIBLE;
+                    if current_style != style {
+                        SetWindowLongPtrW(self.hwnd, GWL_STYLE, style as LONG_PTR);
+                    }
+
+                    let screen_w = GetSystemMetrics(SM_CXSCREEN);
+                    let screen_h = GetSystemMetrics(SM_CYSCREEN);
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        screen_w,
+                        screen_h,
+                        SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                    );
+                }
+                WindowScaleMode::X1 | WindowScaleMode::X1_5 | WindowScaleMode::X2 => {
+                    let scale = match mode {
+                        WindowScaleMode::X1 => 1.0,
+                        WindowScaleMode::X1_5 => 1.5,
+                        WindowScaleMode::X2 => 2.0,
+                        WindowScaleMode::Fullscreen => unreachable!(),
+                    };
+                    let client_w = (BASE_W as f32 * scale).round() as i32;
+                    let client_h = (BASE_H as f32 * scale).round() as i32;
+
+                    // Restore the normal overlapped-window style (skipped if
+                    // it's already that style, e.g. switching X1 -> X2).
+                    if current_style != WS_OVERLAPPEDWINDOW {
+                        SetWindowLongPtrW(self.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW as LONG_PTR);
+                    }
+
+                    let mut rect = RECT {
+                        left: 0,
+                        top: 0,
+                        right: client_w,
+                        bottom: client_h,
+                    };
+                    AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, 0);
+                    let win_w = rect.right - rect.left;
+                    let win_h = rect.bottom - rect.top;
+
+                    let screen_w = GetSystemMetrics(SM_CXSCREEN);
+                    let screen_h = GetSystemMetrics(SM_CYSCREEN);
+                    let x = (screen_w - win_w) / 2;
+                    let y = (screen_h - win_h) / 2;
+
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND_TOP,
+                        x,
+                        y,
+                        win_w,
+                        win_h,
+                        SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+        self.window_scale = mode;
     }
 
     /// Seconds since an arbitrary epoch, from QueryPerformanceCounter.

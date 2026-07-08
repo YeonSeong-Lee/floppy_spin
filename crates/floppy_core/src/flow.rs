@@ -155,8 +155,10 @@ impl ShakeLevel {
 }
 
 /// Window scale setting (SPEC §7 / game_design.md §9: scales the window,
-/// never the internal 960x540 buffer). Stored only for now; `main.rs` window
-/// resize plumbing is M8 scope.
+/// never the internal 960x540 buffer). Applied by the platform layer: `main.rs`
+/// maps this to `platform::win32::WindowScaleMode` and calls
+/// `Platform::set_window_scale` on boot and whenever Settings is left with a
+/// changed value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowScale {
     X1,

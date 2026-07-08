@@ -264,15 +264,14 @@ impl MinigameState {
     }
 }
 
-/// Deterministic placeholder for the AI's launch roll (M4-B scope; the full
-/// utility controller is M5 — SPEC §11). Models "the AI rolls its own
-/// quality from skill params" (game_design.md §4) as a single RNG-driven
+/// The AI's launch roll (SPEC §11). Models "the AI rolls its own quality from
+/// skill params" (game_design.md §4) as a single deterministic RNG-driven
 /// power sample whose spread narrows with difficulty (Ace lands near-PERFECT
 /// almost every time, Easy is close to a coin flip across the whole range),
 /// then reuses the exact same [`classify_power`] bands a human lock would
 /// hit. `heading`/`depth`/`spin_dir` are supplied by the caller (`flow.rs`
 /// picks a fixed opposite-side heading and the preset's default spin) since
-/// this milestone's AI has no positioning logic of its own yet.
+/// the AI has no positioning logic of its own.
 pub fn ai_roll(
     rng: &mut Rng,
     difficulty: Difficulty,
