@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use floppy_core::arena;
 use floppy_core::combat::{CombatState, SpecialId};
 use floppy_core::input::InputState;
+use floppy_core::minigame::{MinigameState, Stage};
 use floppy_core::physics::{BattleEvent, LaunchParams, Stats, Top, World, TUNE};
 use floppy_core::rng::Rng;
 use floppy_core::roster::{Preset, Silhouette, PRESETS};
 use floppy_core::vec::{Vec2, Vec3};
 use floppy_render::battle::BattleScene;
+use floppy_render::hud;
 use floppy_render::particles::{self, ParticlePool};
 use floppy_render::post::PostState;
 
@@ -215,63 +217,43 @@ fn world_of(tops: [Top; 2], seed: u64) -> World {
     }
 }
 
-/// `golden_rest.png`: two tops at `(+-2.5, ground, 0)`, full spin, distinct
-/// silhouettes Cleaver vs Bulwark.
-fn golden_rest_world(cleaver: &Preset, bulwark: &Preset) -> World {
-    let x = 2.5f32;
+/// `golden_midfight.png`: both tops mid-arena, both grounded and moving at
+/// speed on a converging course, tilted (readable silhouettes, not just
+/// upright cylinders), Cleaver vs Bulwark for maximum silhouette contrast.
+/// Wider separation than the old `golden_rest` pose (task spec: "the money
+/// shot — make it read well: distinct silhouettes, some tilt, rings
+/// visible") so both tops sit clear of the center hole and each reads as its
+/// own distinct shape against the neon rings.
+fn golden_midfight_world(cleaver: &Preset, bulwark: &Preset) -> World {
+    let x = 4.2f32;
     let top0 = top_at(
-        Vec3::new(-x, arena::height(-x, 0.0), 0.0),
-        Vec3::default(),
-        TUNE.spin_max,
+        Vec3::new(-x, arena::height(-x, 0.0), 1.0),
+        Vec3::new(3.0, 0.0, -0.6),
+        TUNE.spin_max * 0.85,
         cleaver.spin_dir,
-        Vec2::default(),
+        Vec2::new(0.16, 0.05),
         true,
         0,
         cleaver.stats,
     );
     let top1 = top_at(
-        Vec3::new(x, arena::height(x, 0.0), 0.0),
-        Vec3::default(),
-        TUNE.spin_max,
+        Vec3::new(x, arena::height(x, 0.0), -1.0),
+        Vec3::new(-3.0, 0.0, 0.6),
+        TUNE.spin_max * 0.35,
         bulwark.spin_dir,
-        Vec2::default(),
+        Vec2::new(0.10, -0.06),
         true,
         0,
         bulwark.stats,
     );
-    world_of([top0, top1], 1)
+    world_of([top0, top1], 10)
 }
 
-/// `golden_clash.png`: tops adjacent at center in a mid-collision pose
-/// (overlapping the collision sphere sum-radius), tilt 0.15/0.2, one
-/// `dash_active`.
-fn golden_clash_world(cleaver: &Preset, bulwark: &Preset) -> World {
-    let top0 = top_at(
-        Vec3::new(-0.9, arena::height(-0.9, 0.0), 0.0),
-        Vec3::new(3.0, 0.0, 0.0),
-        TUNE.spin_max * 0.8,
-        cleaver.spin_dir,
-        Vec2::new(0.15, 0.0),
-        true,
-        6,
-        cleaver.stats,
-    );
-    let top1 = top_at(
-        Vec3::new(0.9, arena::height(0.9, 0.0), 0.0),
-        Vec3::new(-3.0, 0.0, 0.0),
-        TUNE.spin_max * 0.8,
-        bulwark.spin_dir,
-        Vec2::new(0.2, 0.0),
-        true,
-        0,
-        bulwark.stats,
-    );
-    world_of([top0, top1], 2)
-}
-
-/// `golden_air.png`: one top airborne at `y = 3` with tilt 0.3 (shadow blob
-/// visible), the other grounded on the wall slope at `r = 6`.
-fn golden_air_world(cleaver: &Preset, bulwark: &Preset) -> World {
+/// `golden_airclash.png`: adapted from the former `golden_air.png` staged
+/// pose — one top airborne mid-clash (shadow blob visible), the other
+/// grounded on the wall slope — kept because it is exactly the "airborne
+/// clash" SPEC §12 asks for.
+fn golden_airclash_world(cleaver: &Preset, bulwark: &Preset) -> World {
     let top0 = top_at(
         Vec3::new(0.0, 3.0, 0.0),
         Vec3::new(0.0, -2.0, 0.0),
@@ -296,17 +278,113 @@ fn golden_air_world(cleaver: &Preset, bulwark: &Preset) -> World {
     world_of([top0, top1], 3)
 }
 
-const GOLDEN_NAMES: [&str; 3] = ["golden_rest.png", "golden_clash.png", "golden_air.png"];
-
-fn staged_goldens() -> [World; 3] {
-    let cleaver = preset_by_silhouette(Silhouette::Cleaver);
-    let bulwark = preset_by_silhouette(Silhouette::Bulwark);
-    [
-        golden_rest_world(cleaver, bulwark),
-        golden_clash_world(cleaver, bulwark),
-        golden_air_world(cleaver, bulwark),
-    ]
+/// `golden_ringout.png`: top 0 already well past `arena::RING_OUT_RADIUS`
+/// (9.6 m) and clear of the rim height at that radius (out over open space,
+/// the ring-out moment itself), top 1 still spinning safely inside the bowl.
+fn golden_ringout_world(cleaver: &Preset, bulwark: &Preset) -> World {
+    let r_out = 11.0f32;
+    let clear_y = arena::height(r_out, 0.0) + 1.5;
+    let top0 = top_at(
+        Vec3::new(r_out, clear_y, 0.0),
+        Vec3::new(4.0, -1.0, 0.0),
+        TUNE.spin_max * 0.5,
+        cleaver.spin_dir,
+        Vec2::new(0.25, 0.1),
+        false,
+        0,
+        cleaver.stats,
+    );
+    let top1 = top_at(
+        Vec3::new(-1.0, arena::height(-1.0, 0.0), 0.0),
+        Vec3::default(),
+        TUNE.spin_max * 0.9,
+        bulwark.spin_dir,
+        Vec2::default(),
+        true,
+        0,
+        bulwark.stats,
+    );
+    world_of([top0, top1], 4)
 }
+
+const GOLDEN_NAMES: [&str; 6] = [
+    "golden_title.png",
+    "golden_launch.png",
+    "golden_midfight.png",
+    "golden_airclash.png",
+    "golden_ringout.png",
+    "golden_result.png",
+];
+
+/// `ui_frame` pinned for `golden_title.png` (module docs / task spec):
+/// `(30/36)%2 == 0` puts "PRESS ANY KEY" in its "on" blink phase, and the
+/// idle-top orbit angle `30 * 0.06 = 1.8` rad is well off either axis so the
+/// orbiting-top-with-trail effect reads clearly (not caught at `angle == 0`
+/// where the trail would visually stack on the leader).
+const TITLE_UI_FRAME: u32 = 30;
+
+/// Pinned `power_phase` for `golden_launch.png`'s `Stage::Power` marker
+/// (module docs / task spec): `power_period` at `Difficulty::Normal` is used
+/// (the default `MinigameState::new` value), and this phase is chosen so
+/// `triangle_value(phase, period)` lands inside the PERFECT band
+/// (`PERFECT_CENTER +- PERFECT_HALF_WIDTH` = 83..89) — see
+/// `build_launch_minigame`'s assertion, which pins the exact percentage this
+/// documents.
+const LAUNCH_POWER_PHASE_FRAC: f32 = 0.86;
+
+/// Deterministic staged `MinigameState` for `golden_launch.png`: forced into
+/// `Stage::Power` (bypassing `Aim`/`SpinDir` input-driven transitions, which
+/// would otherwise need a scripted step sequence for a single frame) with a
+/// pinned heading/depth/spin_dir and `power_phase` set directly so the sweep
+/// marker sits at a fixed, documented, PERFECT-band position.
+fn build_launch_minigame(spin_dir: i8) -> MinigameState {
+    let mut mg = MinigameState::new(spin_dir);
+    mg.stage = Stage::Power;
+    mg.heading = std::f32::consts::FRAC_PI_4;
+    mg.depth = 0.7;
+    mg.power_phase = mg.power_period * LAUNCH_POWER_PHASE_FRAC;
+    mg
+}
+
+/// `golden_launch.png`'s 3D backdrop: both tops grounded, mid-approach
+/// (matches the Launch phase's cosmetic-preview backdrop in `main.rs`, which
+/// draws the live launch world under the minigame overlay).
+fn golden_launch_world(cleaver: &Preset, bulwark: &Preset) -> World {
+    let top0 = top_at(
+        Vec3::new(-4.0, arena::height(-4.0, 0.0), 0.0),
+        Vec3::new(1.5, 0.0, 0.0),
+        TUNE.spin_max,
+        cleaver.spin_dir,
+        Vec2::default(),
+        true,
+        0,
+        cleaver.stats,
+    );
+    let top1 = top_at(
+        Vec3::new(4.0, arena::height(4.0, 0.0), 0.0),
+        Vec3::new(-1.5, 0.0, 0.0),
+        TUNE.spin_max,
+        bulwark.spin_dir,
+        Vec2::default(),
+        true,
+        0,
+        bulwark.stats,
+    );
+    world_of([top0, top1], 5)
+}
+
+/// `golden_result.png` is `hud::draw_round_result` over the void background
+/// (no 3D backdrop — matches nothing in `main.rs`'s render match arm
+/// directly since RoundResult draws over the live battle backdrop there, but
+/// SPEC §12 lists `result` as its own named golden distinct from the
+/// mid-fight shot, so this pins the HUD-only content deterministically: a
+/// cleared background + the tally screen at a fixed frame past the last
+/// pip's landing).
+const RESULT_UI_FRAME: u32 = 40;
+const RESULT_ROUND: u32 = 1;
+const RESULT_SCORE: [u8; 2] = [3, 1];
+const RESULT_LAST_WINNER: Option<u8> = Some(0);
+const RESULT_LAST_POINTS: u8 = 3;
 
 fn staged_visuals() -> [&'static Preset; 2] {
     [
@@ -315,21 +393,67 @@ fn staged_visuals() -> [&'static Preset; 2] {
     ]
 }
 
-/// Render the 3 staged goldens (alpha = 1.0) into raw `0x00RRGGBB` pixel
-/// buffers, in [`GOLDEN_NAMES`] order. M7: routed through the FULL
-/// bloom/dither/scanline/vignette post pipeline (`BattleScene::draw_ex` +
-/// `PostState::composite`) so the checked-in goldens actually exercise it —
-/// but with every EVENT-DRIVEN effect at its documented OFF/zero state:
-/// `ring_pulse = 0.0` (headless has no `Tracker` in this path — see the
-/// `--scene battle` docs below for the same call), `shake = (0.0, 0.0)`, an
-/// empty `ParticlePool`, and no flash (`Vec3::default()`). This keeps the
-/// goldens a pure function of the staged `World`s (deterministic, no RNG
-/// consumed) while still catching regressions in bloom/dither/scanline/
-/// vignette themselves.
-fn render_staged(scene: &BattleScene) -> [Vec<u32>; 3] {
+/// Deterministic particle-rng seed shared by every golden that spawns a
+/// burst (module docs: goldens must be a pure function of nothing but their
+/// own constants, never wall-clock/never a shared mutable seed that could
+/// drift with unrelated code changes elsewhere in this file).
+const GOLDEN_PARTICLE_SEED: u64 = 0x0060_1DE0_0000_0001;
+
+/// How many 60 Hz `ParticlePool::update()` ticks to run after spawning a
+/// burst before rendering it (module docs): 0 would render particles at
+/// their spawn instant (a single bright pinpoint); a small fixed count lets
+/// the burst visibly spread/fall/fade to a representative mid-life pose
+/// while staying fully deterministic (same seed + same tick count every
+/// call).
+const GOLDEN_PARTICLE_TICKS: u32 = 6;
+
+/// Render the 6 SPEC §12-named ship goldens (alpha = 1.0) into raw
+/// `0x00RRGGBB` pixel buffers, in [`GOLDEN_NAMES`] order. Each one is routed
+/// through the SAME composite shape `main.rs` uses for its screen (clear +
+/// scene/HUD + `PostState::composite`), so the checked-in goldens exercise
+/// the real ship pipeline, not a simplified stand-in:
+///
+/// - `golden_title`: `clear(COL_BG)` -> `hud::draw_title` -> composite (no
+///   flash), matching `Screen::Title`'s render arm exactly.
+/// - `golden_launch`: `BattleScene::draw_ex` (mid-approach backdrop) ->
+///   `hud::draw_launch_ui` -> composite, matching `MatchPhase::Launch`.
+/// - `golden_midfight`: `draw_ex` -> `hud::draw_battle_hud` -> composite,
+///   matching `MatchPhase::Fight`.
+/// - `golden_airclash`: `draw_ex` (with a deterministic `spawn_airborne_clash`
+///   burst ticked forward `GOLDEN_PARTICLE_TICKS` frames) -> battle HUD ->
+///   composite.
+/// - `golden_ringout`: `draw_ex` -> battle HUD + `hud::draw_banner` "RING
+///   OUT!" -> composite with the same red-orange flash tint `main.rs` fires
+///   on `BattleEvent::RingOut` (`RED_ORANGE * 0.30`).
+/// - `golden_result`: `clear(COL_BG)` -> `hud::draw_round_result` ->
+///   composite (no 3D backdrop — see that fn's doc comment).
+///
+/// Every EVENT-DRIVEN effect not called out above sits at its documented
+/// OFF/zero state: `ring_pulse = 0.0` (headless has no `Tracker` in this
+/// path), `shake = (0.0, 0.0)`, no flash unless documented above. This keeps
+/// every golden a pure function of its own staged state (deterministic, no
+/// wall-clock, RNG only from the fixed seeds above) while still catching
+/// regressions in bloom/dither/scanline/vignette/particles themselves.
+fn render_staged(scene: &BattleScene) -> [Vec<u32>; 6] {
     let visuals = staged_visuals();
-    let empty_particles = ParticlePool::new();
-    staged_goldens().map(|world| {
+    let cleaver = preset_by_silhouette(Silhouette::Cleaver);
+    let bulwark = preset_by_silhouette(Silhouette::Bulwark);
+
+    // -- golden_title --------------------------------------------------
+    let title_px = {
+        let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        frame.clear(hud::COL_BG);
+        hud::draw_title(&mut frame, TITLE_UI_FRAME);
+        post.composite(&mut frame, Vec3::default());
+        frame.px
+    };
+
+    // -- golden_launch ----------------------------------------------------
+    let launch_px = {
+        let world = golden_launch_world(cleaver, bulwark);
+        let mg = build_launch_minigame(cleaver.spin_dir);
+        let empty_particles = ParticlePool::new();
         let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
         let mut post = PostState::new(WIDTH, HEIGHT);
         scene.draw_ex(
@@ -343,9 +467,119 @@ fn render_staged(scene: &BattleScene) -> [Vec<u32>; 3] {
             (0.0, 0.0),
             &empty_particles,
         );
+        hud::draw_launch_ui(&mut frame, &mg, bulwark.spin_dir, TITLE_UI_FRAME);
         post.composite(&mut frame, Vec3::default());
         frame.px
-    })
+    };
+
+    // -- golden_midfight --------------------------------------------------
+    let midfight_px = {
+        let mut world = golden_midfight_world(cleaver, bulwark);
+        world.tops[0].meter = 100.0; // Armed glow on P1's panel.
+        let empty_particles = ParticlePool::new();
+        let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        scene.draw_ex(
+            &mut frame,
+            &mut post,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &empty_particles,
+        );
+        hud::draw_battle_hud(&mut frame, &world, visuals, [2, 1], TITLE_UI_FRAME, false);
+        post.composite(&mut frame, Vec3::default());
+        frame.px
+    };
+
+    // -- golden_airclash ----------------------------------------------------
+    let airclash_px = {
+        let world = golden_airclash_world(cleaver, bulwark);
+        let mut particle_rng = Rng::new(GOLDEN_PARTICLE_SEED);
+        let mut particles = ParticlePool::new();
+        particles::spawn_airborne_clash(&mut particles, &mut particle_rng, world.tops[0].pos);
+        for _ in 0..GOLDEN_PARTICLE_TICKS {
+            particles.update();
+        }
+        let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        scene.draw_ex(
+            &mut frame,
+            &mut post,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &particles,
+        );
+        hud::draw_battle_hud(&mut frame, &world, visuals, [1, 1], TITLE_UI_FRAME, false);
+        post.composite(&mut frame, Vec3::default());
+        frame.px
+    };
+
+    // -- golden_ringout ----------------------------------------------------
+    let ringout_px = {
+        let world = golden_ringout_world(cleaver, bulwark);
+        let mut particle_rng = Rng::new(GOLDEN_PARTICLE_SEED ^ 1);
+        let mut particles = ParticlePool::new();
+        particles::spawn_ring_out(&mut particles, &mut particle_rng, world.tops[0].pos);
+        for _ in 0..GOLDEN_PARTICLE_TICKS {
+            particles.update();
+        }
+        let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        scene.draw_ex(
+            &mut frame,
+            &mut post,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &particles,
+        );
+        hud::draw_battle_hud(&mut frame, &world, visuals, [1, 2], TITLE_UI_FRAME, false);
+        hud::draw_banner(&mut frame, "RING OUT!", 6, hud::COL_ICE);
+        // Same red-orange flash tint `main.rs` fires on `BattleEvent::RingOut`
+        // (`particles::RED_ORANGE * 0.30` — see that match arm's docs).
+        post.composite(&mut frame, particles::RED_ORANGE * 0.30);
+        frame.px
+    };
+
+    // -- golden_result ----------------------------------------------------
+    let result_px = {
+        let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        frame.clear(hud::COL_BG);
+        hud::draw_round_result(
+            &mut frame,
+            RESULT_ROUND,
+            RESULT_SCORE,
+            [visuals[0].accent, visuals[1].accent],
+            "RING OUT!",
+            RESULT_UI_FRAME,
+            RESULT_LAST_WINNER,
+            RESULT_LAST_POINTS,
+            false,
+        );
+        post.composite(&mut frame, Vec3::default());
+        frame.px
+    };
+
+    [
+        title_px,
+        launch_px,
+        midfight_px,
+        airclash_px,
+        ringout_px,
+        result_px,
+    ]
 }
 
 fn golden_dir() -> PathBuf {

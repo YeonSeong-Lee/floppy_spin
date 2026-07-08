@@ -424,7 +424,6 @@ pub fn draw_title(frame: &mut Frame, ui_frame: u32) {
     if (ui_frame / 36).is_multiple_of(2) {
         draw_text_centered(frame, 380, 2, COL_ICE, "PRESS ANY KEY");
     }
-    draw_text_centered(frame, 505, 1, COL_DIM, "M7 BUILD - ESC QUITS");
 }
 
 /// `cursor` picks which item is highlighted (text color snaps instantly);
