@@ -202,8 +202,10 @@ are pure functions of `BattleEvent`s (headlessly reproducible). Music: lightweig
 tracker, 4 channels, `i8` patterns embedded in code, menu + battle themes; battle theme
 adds an intensity layer at bar boundaries while a special is armed (keyed off tracker
 row index, never off audio output). Windows output: `waveOut` multi-buffer ring in
-`platform::win32`; buffers as small as sustain glitch-free. Headless renders the same
-mixer output to WAV.
+`platform::win32`; buffers as small as sustain glitch-free. The mono→stereo L=R
+duplication exists only at that waveOut hardware boundary; the mixer itself is mono
+end-to-end, and the headless WAV goldens are the raw MONO mixer output (duplication
+adds no information worth pinning twice).
 
 ## 9. Persistence
 

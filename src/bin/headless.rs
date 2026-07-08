@@ -405,10 +405,10 @@ fn run_golden_check() {
 // battle`, but stepped WITHOUT rendering any video, feeding
 // `floppy_core::physics::BattleEvent`s and a steady spin-hum retrigger to
 // the audio core each 60 Hz frame, exactly like `main.rs`'s real-time
-// wiring — except here BOTH of the 2 per-frame 120 Hz sim steps get their
-// events drained (see the milestone report on why `main.rs`, going through
-// `flow::FlowState::advance`, cannot do the same for the first of its 2
-// sub-steps).
+// wiring. Both of the 2 per-frame 120 Hz sim steps get their events drained
+// here directly; `main.rs` gets the same completeness via
+// `flow::FlowState::frame_events`, which accumulates across sub-steps (see
+// its doc comment in flow.rs).
 // ---------------------------------------------------------------------------
 
 /// Mono samples per 60 Hz frame at `floppy_audio::SAMPLE_RATE` (44_100/60 =

@@ -398,10 +398,17 @@ impl AudioRing {
             return AudioRing::closed();
         }
 
+        // Build every buffer FIRST, then prepare each header at its final
+        // heap address (M5/M6 verifier finding: preparing a stack-local
+        // WAVEHDR and moving it afterward worked in practice because the
+        // driver only retains lpData, but prepare-then-move is not the
+        // textbook-safe ordering). The capacity is exact and nothing pushes
+        // later, so the Vec never reallocates and the addresses are
+        // permanent for the ring's whole life.
         let mut buffers = Vec::with_capacity(AUDIO_RING_BUFFERS);
         for _ in 0..AUDIO_RING_BUFFERS {
             let mut data = vec![0i16; AUDIO_BUFFER_FRAMES * 2];
-            let mut hdr = WAVEHDR {
+            let hdr = WAVEHDR {
                 lpData: data.as_mut_ptr() as *mut u8,
                 dwBufferLength: (data.len() * size_of::<i16>()) as DWORD,
                 dwBytesRecorded: 0,
@@ -411,14 +418,30 @@ impl AudioRing {
                 lpNext: ptr::null_mut(),
                 reserved: 0,
             };
-            unsafe {
-                waveOutPrepareHeader(hwo, &mut hdr, size_of::<WAVEHDR>() as UINT);
-            }
             buffers.push(AudioBuffer {
                 data,
                 hdr,
                 queued: false,
             });
+        }
+        for buf in &mut buffers {
+            let result =
+                unsafe { waveOutPrepareHeader(hwo, &mut buf.hdr, size_of::<WAVEHDR>() as UINT) };
+            if result != MMSYSERR_NOERROR {
+                // Degrade to the silent no-device path rather than running a
+                // ring with a half-prepared header set: unprepare whatever
+                // did prepare (unpreparing a never-prepared header is safe —
+                // winmm no-ops on the missing WHDR_PREPARED flag), close,
+                // and report "no audio".
+                unsafe {
+                    waveOutReset(hwo);
+                    for b in &mut buffers {
+                        waveOutUnprepareHeader(hwo, &mut b.hdr, size_of::<WAVEHDR>() as UINT);
+                    }
+                    waveOutClose(hwo);
+                }
+                return AudioRing::closed();
+            }
         }
 
         AudioRing { hwo, buffers }
@@ -448,8 +471,14 @@ impl AudioRing {
             buf.data[i * 2 + 1] = s;
         }
         buf.queued = true;
-        unsafe {
-            waveOutWrite(self.hwo, &mut buf.hdr, size_of::<WAVEHDR>() as UINT);
+        let result = unsafe { waveOutWrite(self.hwo, &mut buf.hdr, size_of::<WAVEHDR>() as UINT) };
+        if result != MMSYSERR_NOERROR {
+            // The driver rejected the write, so WHDR_DONE will never arrive
+            // for this header; un-mark the slot or it would stay "queued"
+            // forever and silently shrink the ring (M5/M6 verifier finding).
+            // The chunk itself is dropped — one lost ~23 ms of audio beats a
+            // permanently stranded buffer.
+            buf.queued = false;
         }
     }
 
