@@ -39,6 +39,7 @@
 //! MatchOver → back to MainMenu. `Esc` arrives as a separate `bool` because
 //! `InputState` (SPEC §6.4) has no escape field.
 
+use crate::ai;
 use crate::combat::SpecialId;
 use crate::input::InputState;
 use crate::minigame::{ai_roll, Difficulty, LaunchChoice, MinigameState};
@@ -82,6 +83,12 @@ pub const SETTINGS_ROWS: usize = 6;
 /// stream is independent of the `World`'s own stream (both derive from the
 /// same round seed).
 const AI_ROLL_SEED_SALT: u64 = 0x00A1_0000_0000_0001;
+
+/// Salt XORed into the round seed for the Fight-phase utility AI's own
+/// [`ai::AiState`] (M5, SPEC §11) — distinct from both `AI_ROLL_SEED_SALT`
+/// and the `World`'s own `rng` so the three RNG streams derived from the same
+/// round seed never correlate.
+const AI_FIGHT_SEED_SALT: u64 = 0x00A2_0000_0000_0001;
 
 /// Match sub-phase (SPEC §7: `Intro > Launch > Fight > Decided >
 /// RoundResult -(loop)-> MatchOver`).
@@ -266,6 +273,11 @@ pub struct FlowState {
     pub minigame: MinigameState,
     /// The AI's pre-rolled launch (computed once at Intro→Launch).
     pub ai_choice: Option<LaunchChoice>,
+    /// The Fight-phase utility AI's own state (M5, SPEC §11): reaction-delay
+    /// buffer, committed-plan timers, its own `Rng` stream. Lives outside
+    /// `World` (not sim state); (re)created fresh each round in
+    /// `spawn_fight_world` from the round seed + `AI_FIGHT_SEED_SALT`.
+    pub ai_state: Option<ai::AiState>,
     /// Current round world. During Intro/Launch this holds a cosmetic
     /// PREVIEW world (never stepped) so the renderer has an arena + tops to
     /// draw; from Fight on it is the real stepped sim.
@@ -316,10 +328,11 @@ pub fn outcome_banner(outcome: Outcome, end: Option<crate::combat::RoundEnd>) ->
     }
 }
 
-/// Scripted dummy-AI fight input: plain chase toward P1 (top index 0),
-/// dashing when far and off cooldown. Pure function of the world's public
-/// state — no RNG, no trig (sign tests only). The real utility AI is M5
-/// (SPEC §11); this exists so M4's Fight phase has a live opponent.
+/// **Superseded by [`ai::decide`] (M5, SPEC §11)** — the Fight phase now
+/// drives its AI top through the real utility controller; this scripted
+/// dummy is kept only because existing tests exercise it directly. Plain
+/// chase toward P1 (top index 0), dashing when far and off cooldown. Pure
+/// function of the world's public state — no RNG, no trig (sign tests only).
 pub fn chase_input(world: &World) -> InputState {
     const DEADZONE: f32 = 0.25;
     const DASH_DIST_SQ: f32 = 9.0; // dash when > 3 m away
@@ -440,6 +453,7 @@ impl FlowState {
             quit_requested: false,
             minigame: MinigameState::new(PRESETS[0].spin_dir),
             ai_choice: None,
+            ai_state: None,
             world: None,
             world_prev: None,
             last_outcome: None,
@@ -571,6 +585,10 @@ impl FlowState {
         world.tops[1].tilt = Vec2::new(ai_choice.start_tilt, 0.0);
         self.world_prev = Some(world.clone());
         self.world = Some(world);
+        // Fresh AI controller state for the Fight phase (M5): seeded from
+        // this round's seed, mixed with a salt distinct from `World::rng`
+        // and the launch-roll RNG so the three streams never correlate.
+        self.ai_state = Some(ai::AiState::new(self.round_seed() ^ AI_FIGHT_SEED_SALT));
     }
 
     /// Match abort / teardown (Esc during a match, or MatchOver exit).
@@ -578,6 +596,7 @@ impl FlowState {
         self.world = None;
         self.world_prev = None;
         self.ai_choice = None;
+        self.ai_state = None;
     }
 
     /// Advance one flow frame (module docs). ALL screen transitions are
@@ -711,13 +730,26 @@ impl FlowState {
                     self.clear_match();
                     next = Some(Screen::MainMenu);
                 } else if let Some(mut world) = self.world.take() {
+                    // Difficulty comes straight from settings (M5, SPEC
+                    // §11); resolved once outside the loop so the per-step
+                    // AI call below never needs to borrow `self.settings`
+                    // alongside the mutable `self.ai_state` borrow.
+                    let params = ai::tier(self.settings.difficulty);
                     for _ in 0..SIM_STEPS_PER_FLOW_FRAME {
                         if world.outcome.is_some() {
                             break;
                         }
-                        let ai = chase_input(&world);
+                        let ai_input = match self.ai_state.as_mut() {
+                            Some(state) => ai::decide(state, &world, 1, &params),
+                            // Defensive fallback only: `ai_state` is always
+                            // populated by `spawn_fight_world` before Fight
+                            // is reachable, but keep the old dummy so a
+                            // missing-state world still has a live opponent
+                            // rather than an idle one.
+                            None => chase_input(&world),
+                        };
                         self.world_prev = Some(world.clone());
-                        world.step([input, ai]);
+                        world.step([input, ai_input]);
                     }
                     if let Some(outcome) = world.outcome {
                         self.last_outcome = Some(outcome);
