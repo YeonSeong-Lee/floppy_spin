@@ -43,7 +43,7 @@ use crate::ai;
 use crate::combat::SpecialId;
 use crate::input::InputState;
 use crate::minigame::{ai_roll, Difficulty, LaunchChoice, MinigameState};
-use crate::physics::{LaunchParams, Outcome, World};
+use crate::physics::{BattleEvent, LaunchParams, Outcome, World};
 use crate::rng::{mix_seed, Rng};
 use crate::roster::PRESETS;
 use crate::vec::Vec2;
@@ -285,6 +285,15 @@ pub struct FlowState {
     /// Snapshot taken immediately before the most recent `World::step`, for
     /// `pose_lerp` render interpolation (SPEC §5).
     pub world_prev: Option<World>,
+    /// Every `BattleEvent` emitted during THIS flow frame, across all of the
+    /// frame's sim sub-steps. `World::step` clears `World::events` at the top
+    /// of each call, so with [`SIM_STEPS_PER_FLOW_FRAME`] = 2 a consumer
+    /// reading `world.events` after `advance()` only ever sees the LAST
+    /// sub-step's events — the first sub-step's hits would be silently lost
+    /// (M6-B finding: dropped SFX in the live loop). Render/audio consumers
+    /// must read this buffer instead; it is presentation plumbing, not sim
+    /// state (never hashed, sim never reads it).
+    pub frame_events: Vec<BattleEvent>,
     /// The outcome that decided the current/most recent round.
     pub last_outcome: Option<Outcome>,
     /// Points awarded for the decided round and to whom (None = draw).
@@ -456,6 +465,7 @@ impl FlowState {
             ai_state: None,
             world: None,
             world_prev: None,
+            frame_events: Vec::new(),
             last_outcome: None,
             last_winner: None,
             last_points: 0,
@@ -605,6 +615,8 @@ impl FlowState {
     pub fn advance(&mut self, input: InputState, esc: bool) {
         let e = detect_edges(self.prev_input, input, self.prev_esc, esc);
         let mut next: Option<Screen> = None;
+        // Fresh event window every flow frame; only the Fight arm refills it.
+        self.frame_events.clear();
 
         match self.screen {
             // Boot ▶ Title: auto after BOOT_FRAMES.
@@ -750,6 +762,7 @@ impl FlowState {
                         };
                         self.world_prev = Some(world.clone());
                         world.step([input, ai_input]);
+                        self.frame_events.extend_from_slice(&world.events);
                     }
                     if let Some(outcome) = world.outcome {
                         self.last_outcome = Some(outcome);

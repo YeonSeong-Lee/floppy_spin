@@ -318,27 +318,15 @@ fn main() {
                     .unwrap_or(false);
             tracker.set_intensity(armed_in_fight);
 
-            // ---- SFX from BattleEvents, Fight only. `fight_active` checks
-            // BOTH the screen before and after this `advance()` call so the
-            // exact frame Fight ends (screen already reads Decided) still
-            // drains the finishing hit's events. See the milestone report
-            // for `World::events`' clear-per-step lifecycle and the
-            // resulting caveat: `flow::advance` runs up to 2 sim steps per
-            // flow frame internally and only the LAST step's events survive
-            // (`World::step` clears `events` at the top of every call that
-            // doesn't early-return with an outcome already set), so a
-            // BattleEvent produced only on the first of those 2 sub-steps
-            // during an ordinary (non-round-ending) frame is not visible
-            // here — a real, documented gap `main.rs` cannot close without
-            // touching `flow.rs` (out of scope for this milestone).
-            let fight_active = matches!(prev_nav.screen, Screen::Match(MatchPhase::Fight))
-                || matches!(flow_state.screen, Screen::Match(MatchPhase::Fight));
-            if fight_active {
-                if let Some(world) = &flow_state.world {
-                    for ev in &world.events {
-                        on_event(&mut mixer, ev);
-                    }
-                }
+            // ---- SFX from BattleEvents. `flow.frame_events` accumulates
+            // across ALL of the frame's sim sub-steps (see its doc comment —
+            // reading `world.events` here instead would drop every event the
+            // first of the 2 sub-steps produced), and it's cleared at the
+            // top of every `advance()`, so draining it unconditionally is
+            // correct on every screen including the exact Fight→Decided
+            // transition frame that carries the finishing hit.
+            for ev in &flow_state.frame_events {
+                on_event(&mut mixer, ev);
             }
 
             // ---- Spin hum: steady per-flow-frame retrigger/retune while

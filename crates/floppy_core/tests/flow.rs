@@ -457,3 +457,56 @@ fn identical_scripts_replay_to_identical_flow_state() {
     }
     assert_eq!(script(42), script(42));
 }
+
+/// `FlowState::frame_events` must accumulate events across BOTH of a flow
+/// frame's sim sub-steps (M6-B finding: `World::step` clears `World::events`
+/// per call, so reading `world.events` after `advance()` silently drops
+/// everything the first sub-step emitted — audible as missing hit SFX).
+/// This drives a real fight and requires at least one frame where the
+/// accumulated buffer is strictly larger than the surviving `world.events`,
+/// i.e. the fix demonstrably captured events the old path lost. It also
+/// checks the buffer clears outside Fight (no stale events leak into menus).
+#[test]
+fn frame_events_accumulate_across_sub_steps_and_clear_outside_fight() {
+    let mut d = Driver::new(7);
+    enter_fight(&mut d);
+
+    let mut saw_accumulation_beat_last_substep = false;
+    let mut total_frame_events = 0usize;
+    for _ in 0..200_000 {
+        if d.flow.screen != Screen::Match(MatchPhase::Fight) {
+            break;
+        }
+        d.step(InputState::default());
+        total_frame_events += d.flow.frame_events.len();
+        let surviving = d.flow.world.as_ref().map_or(0, |w| w.events.len());
+        assert!(
+            d.flow.frame_events.len() >= surviving,
+            "frame_events must be a superset of the last sub-step's events"
+        );
+        if d.flow.frame_events.len() > surviving {
+            saw_accumulation_beat_last_substep = true;
+        }
+    }
+    assert!(
+        total_frame_events > 0,
+        "a full fight must produce BattleEvents"
+    );
+    assert!(
+        saw_accumulation_beat_last_substep,
+        "no frame ever carried a first-sub-step event; either this seed's \
+         fight is degenerate (pick another) or accumulation is broken"
+    );
+
+    // Outside Fight the buffer clears on the next advance.
+    d.run_until(
+        InputState::default(),
+        400,
+        |s| s == Screen::Match(MatchPhase::RoundResult),
+        "banner hold to RoundResult",
+    );
+    assert!(
+        d.flow.frame_events.is_empty(),
+        "frame_events must clear once no sim sub-steps run"
+    );
+}
