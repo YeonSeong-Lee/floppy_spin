@@ -3,14 +3,16 @@
 
 mod platform;
 
+use floppy_audio::{on_event, play, Mixer, Sfx, SongId, Tracker};
 use floppy_core::clock::SimClock;
 use floppy_core::flow::{self, FlowState, MatchPhase, Screen, MATCH_WIN_POINTS};
 use floppy_core::input::InputState;
+use floppy_core::physics::TUNE;
 use floppy_core::roster::PRESETS;
 use floppy_render::battle::BattleScene;
 use floppy_render::frame::Frame;
 use floppy_render::hud;
-use platform::win32::{Platform, VK_ESCAPE};
+use platform::win32::{Platform, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
 const H: usize = 540;
@@ -179,8 +181,80 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio wiring (Task M6-B; SPEC §8, game_design.md §8).
+// ---------------------------------------------------------------------------
+
+/// Which song plays for a given screen: every match phase (Intro/Launch/
+/// Fight/Decided/RoundResult) uses the battle theme — including the
+/// cosmetic-preview Intro/Launch phases, so the riser builds tension into
+/// the fight rather than only starting once Fight begins — and every other
+/// screen uses the menu theme.
+fn song_for_screen(screen: Screen) -> SongId {
+    match screen {
+        Screen::Match(_) => SongId::Battle,
+        _ => SongId::Menu,
+    }
+}
+
+/// The small `Copy` slice of `FlowState` menu-navigation actually needed to
+/// detect cursor/screen deltas for menu SFX — deliberately NOT a clone of
+/// the whole `FlowState` (which would drag along the live `World`, RNG
+/// state, etc. for no reason every flow frame).
+#[derive(Clone, Copy)]
+struct MenuNavSnapshot {
+    screen: Screen,
+    menu_cursor: usize,
+    select_cursor: usize,
+    settings_cursor: usize,
+}
+
+impl MenuNavSnapshot {
+    fn of(flow_state: &FlowState) -> Self {
+        Self {
+            screen: flow_state.screen,
+            menu_cursor: flow_state.menu_cursor,
+            select_cursor: flow_state.select_cursor,
+            settings_cursor: flow_state.settings_cursor,
+        }
+    }
+}
+
+/// Menu navigation SFX, detected from screen/cursor deltas across one flow
+/// frame. `flow::FlowState` doesn't expose cursor-edit events directly, so
+/// this is deliberately render-side (main.rs), per the milestone brief's
+/// explicit "or skip" escape hatch for menu blips — a curated, judgment-call
+/// mapping rather than an exhaustive one: cursor moves within a screen read
+/// as `MenuMove`; a hand-picked set of screen-transition edges reads as
+/// "select" (entering a sub-screen, or confirming a TopSelect pick) or
+/// "back" (leaving one, aborting a match, or leaving MatchOver). Transitions
+/// not listed here (e.g. RoundResult's "any key" advance, which already has
+/// its own tally-ting cue via `Sfx::ScoreTally` elsewhere) are silent by
+/// design, not by omission.
+fn menu_sfx_for(prev: MenuNavSnapshot, cur: MenuNavSnapshot) -> Option<Sfx> {
+    use Screen::*;
+    if prev.screen == cur.screen {
+        return match cur.screen {
+            MainMenu if prev.menu_cursor != cur.menu_cursor => Some(Sfx::MenuMove),
+            TopSelect if prev.select_cursor != cur.select_cursor => Some(Sfx::MenuMove),
+            Settings if prev.settings_cursor != cur.settings_cursor => Some(Sfx::MenuMove),
+            _ => None,
+        };
+    }
+    match (prev.screen, cur.screen) {
+        (Title, MainMenu) => Some(Sfx::MenuSelect),
+        (MainMenu, TopSelect) | (MainMenu, Garage) | (MainMenu, Settings) => Some(Sfx::MenuSelect),
+        (TopSelect, Match(MatchPhase::Intro)) => Some(Sfx::MenuSelect),
+        (TopSelect, MainMenu) | (Garage, MainMenu) | (Settings, MainMenu) => Some(Sfx::MenuBack),
+        (Match(_), MainMenu) => Some(Sfx::MenuBack),
+        (MatchOver, MainMenu) => Some(Sfx::MenuBack),
+        _ => None,
+    }
+}
+
 fn main() {
     let mut platform = Platform::init("FLOPPY SPIN", W as i32, H as i32);
+    platform.audio_init();
     let scene = BattleScene::new();
     let mut frame = Frame::new(W, H);
 
@@ -198,6 +272,17 @@ fn main() {
     let mut pending_steps: u32 = 0;
     let mut last_t = platform.now_s();
 
+    // Audio (Task M6-B / SPEC §8): one `Mixer` for the process lifetime; the
+    // `Tracker` is replaced wholesale on a song switch (no fade — see the
+    // milestone report). `hum_active` remembers whether the spin-hum voice
+    // was sounding so leaving Fight sends exactly one release trigger
+    // (`spin_hum`'s own zero-rpm path handles the actual fade, see
+    // `floppy_audio::sfx`).
+    let mut mixer = Mixer::new();
+    let mut current_song = song_for_screen(flow_state.screen);
+    let mut tracker = Tracker::new(current_song);
+    let mut hum_active = false;
+
     loop {
         let frame_start = platform.now_s();
 
@@ -211,13 +296,98 @@ fn main() {
         last_t = frame_start;
         pending_steps += clock.advance(dt, 8);
         while pending_steps >= flow::SIM_STEPS_PER_FLOW_FRAME {
+            let prev_nav = MenuNavSnapshot::of(&flow_state);
+
             flow_state.advance(input, esc);
             pending_steps -= flow::SIM_STEPS_PER_FLOW_FRAME;
+
+            // ---- Music: replace the Tracker wholesale on a song switch.
+            let desired_song = song_for_screen(flow_state.screen);
+            if desired_song != current_song {
+                tracker = Tracker::new(desired_song);
+                current_song = desired_song;
+            }
+
+            // ---- Intensity layer (game_design.md §8): on iff either top
+            // has a special Armed, only during Fight.
+            let armed_in_fight = matches!(flow_state.screen, Screen::Match(MatchPhase::Fight))
+                && flow_state
+                    .world
+                    .as_ref()
+                    .map(|w| w.tops[0].combat.special_armed || w.tops[1].combat.special_armed)
+                    .unwrap_or(false);
+            tracker.set_intensity(armed_in_fight);
+
+            // ---- SFX from BattleEvents, Fight only. `fight_active` checks
+            // BOTH the screen before and after this `advance()` call so the
+            // exact frame Fight ends (screen already reads Decided) still
+            // drains the finishing hit's events. See the milestone report
+            // for `World::events`' clear-per-step lifecycle and the
+            // resulting caveat: `flow::advance` runs up to 2 sim steps per
+            // flow frame internally and only the LAST step's events survive
+            // (`World::step` clears `events` at the top of every call that
+            // doesn't early-return with an outcome already set), so a
+            // BattleEvent produced only on the first of those 2 sub-steps
+            // during an ordinary (non-round-ending) frame is not visible
+            // here — a real, documented gap `main.rs` cannot close without
+            // touching `flow.rs` (out of scope for this milestone).
+            let fight_active = matches!(prev_nav.screen, Screen::Match(MatchPhase::Fight))
+                || matches!(flow_state.screen, Screen::Match(MatchPhase::Fight));
+            if fight_active {
+                if let Some(world) = &flow_state.world {
+                    for ev in &world.events {
+                        on_event(&mut mixer, ev);
+                    }
+                }
+            }
+
+            // ---- Spin hum: steady per-flow-frame retrigger/retune while
+            // fighting (P1's top only — SPEC §8 reserves a single dedicated
+            // hum voice, not one per top); one explicit release the frame
+            // Fight ends.
+            if matches!(flow_state.screen, Screen::Match(MatchPhase::Fight)) {
+                if let Some(world) = &flow_state.world {
+                    let rpm_frac = world.tops[0].spin / TUNE.spin_max;
+                    play(&mut mixer, Sfx::SpinHum { rpm_frac });
+                    hum_active = true;
+                }
+            } else if hum_active {
+                play(&mut mixer, Sfx::SpinHum { rpm_frac: 0.0 });
+                hum_active = false;
+            }
+
+            // ---- Menu navigation blips (cursor/screen deltas).
+            if let Some(sfx) = menu_sfx_for(prev_nav, MenuNavSnapshot::of(&flow_state)) {
+                play(&mut mixer, sfx);
+            }
         }
         // Esc semantics (quit on Title/MainMenu, back/abort elsewhere) are
         // decided entirely inside flow::advance.
         if flow_state.quit_requested {
             break;
+        }
+
+        // ---- Volume settings -> group gains (SPEC §7: music/SFX volume
+        // 0..=10). Pure f32 multiply before soft-clip inside the mixer, so
+        // this stays deterministic (SPEC §5).
+        mixer.set_group_gains(
+            flow_state.settings.sfx_vol as f32 / 10.0,
+            flow_state.settings.music_vol as f32 / 10.0,
+        );
+
+        // ---- waveOut ring pump (Task M6-B): fill every currently-free
+        // ring buffer with exactly `AUDIO_BUFFER_FRAMES` fresh mono samples.
+        // Advancing the tracker in these fixed-size chunks (rather than once
+        // for the whole render frame) keeps its row scheduling sample-
+        // accurate regardless of render-frame jitter or how many ring slots
+        // happened to free up; `Platform::audio_submit` duplicates mono to
+        // interleaved stereo (SPEC §8) and is a no-op with no audio device.
+        let free_buffers = platform.audio_free_buffers();
+        let mut mono = [0i16; AUDIO_BUFFER_FRAMES];
+        for _ in 0..free_buffers {
+            tracker.advance(&mut mixer, AUDIO_BUFFER_FRAMES as u32);
+            mixer.render(&mut mono);
+            platform.audio_submit(&mono);
         }
 
         // Render interpolation factor: fraction of the way from the previous

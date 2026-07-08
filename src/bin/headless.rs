@@ -27,11 +27,13 @@ enum GoldenMode {
     Check,
 }
 
-fn parse_args() -> (u32, PathBuf, SceneKind, GoldenMode) {
+#[allow(clippy::too_many_arguments)]
+fn parse_args() -> (u32, PathBuf, SceneKind, GoldenMode, Option<PathBuf>) {
     let mut frames: u32 = 3;
     let mut out = PathBuf::from("out");
     let mut scene = SceneKind::Gradient;
     let mut golden = GoldenMode::None;
+    let mut wav: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -73,6 +75,13 @@ fn parse_args() -> (u32, PathBuf, SceneKind, GoldenMode) {
                     std::process::exit(1);
                 }
             },
+            "--wav" => match args.next() {
+                Some(v) => wav = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("--wav requires a value");
+                    std::process::exit(1);
+                }
+            },
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(1);
@@ -80,7 +89,7 @@ fn parse_args() -> (u32, PathBuf, SceneKind, GoldenMode) {
         }
     }
 
-    (frames, out, scene, golden)
+    (frames, out, scene, golden, wav)
 }
 
 /// Deterministic 960x540 test pattern. This formula must match byte-for-byte
@@ -390,8 +399,94 @@ fn run_golden_check() {
     println!("GOLDEN CHECK: PASS");
 }
 
+// ---------------------------------------------------------------------------
+// `--wav out.wav --frames N`: headless audio verification (Task M6-B / SPEC
+// §8, §12). Same scripted battle (world + scripted inputs) as `--scene
+// battle`, but stepped WITHOUT rendering any video, feeding
+// `floppy_core::physics::BattleEvent`s and a steady spin-hum retrigger to
+// the audio core each 60 Hz frame, exactly like `main.rs`'s real-time
+// wiring — except here BOTH of the 2 per-frame 120 Hz sim steps get their
+// events drained (see the milestone report on why `main.rs`, going through
+// `flow::FlowState::advance`, cannot do the same for the first of its 2
+// sub-steps).
+// ---------------------------------------------------------------------------
+
+/// Mono samples per 60 Hz frame at `floppy_audio::SAMPLE_RATE` (44_100/60 =
+/// 735 exactly).
+const WAV_SAMPLES_PER_FRAME: u32 = floppy_audio::SAMPLE_RATE / 60;
+
+/// Render `frames` worth (60 Hz cadence) of the scripted battle's audio to a
+/// flat mono `i16` buffer: a pure function of `frames` alone (fresh World +
+/// Mixer + Tracker every call, scripted inputs are a pure function of the
+/// frame index) — this is exactly what makes the golden-hash test's
+/// twice-in-a-row determinism check meaningful.
+fn render_wav_frames(frames: u32) -> Vec<i16> {
+    let mut world = build_battle_world();
+    let mut mixer = floppy_audio::Mixer::new();
+    let mut tracker = floppy_audio::Tracker::new(floppy_audio::SongId::Battle);
+
+    let mut samples = Vec::with_capacity(WAV_SAMPLES_PER_FRAME as usize * frames as usize);
+    let mut chunk = vec![0i16; WAV_SAMPLES_PER_FRAME as usize];
+
+    for t in 0..frames {
+        let inputs = battle_scripted_inputs(t);
+        // 2 sim steps @120 Hz per 60 Hz audio frame (task spec), draining
+        // events after EACH step (not just the pair) so nothing is lost to
+        // the next step's `World::events` clear.
+        for _ in 0..2 {
+            world.step(inputs);
+            for ev in &world.events {
+                floppy_audio::on_event(&mut mixer, ev);
+            }
+        }
+
+        // Spin hum: steady per-frame retrigger/retune, P1's top (mirrors
+        // main.rs's wiring).
+        let rpm_frac = world.tops[0].spin / floppy_core::physics::TUNE.spin_max;
+        floppy_audio::play(&mut mixer, floppy_audio::Sfx::SpinHum { rpm_frac });
+
+        tracker.advance(&mut mixer, WAV_SAMPLES_PER_FRAME);
+        mixer.render(&mut chunk);
+        samples.extend_from_slice(&chunk);
+    }
+
+    samples
+}
+
+/// FNV-1a64 over the sample buffer's little-endian byte representation, via
+/// `floppy_core::hash::hash_u32s` widening each `i16` through `u16` first (so
+/// the bit pattern, not the signed value, is what's hashed) — the same
+/// convention `floppy_audio`'s own integration tests use.
+fn hash_samples(samples: &[i16]) -> u64 {
+    let words: Vec<u32> = samples.iter().map(|&s| (s as u16) as u32).collect();
+    floppy_core::hash::hash_u32s(&words)
+}
+
+fn run_wav(frames: u32, path: &PathBuf) {
+    let samples = render_wav_frames(frames);
+    let wav_bytes = floppy_io::wav::encode_mono16(floppy_audio::SAMPLE_RATE, &samples);
+
+    if let Err(e) = fs::write(path, &wav_bytes) {
+        eprintln!("failed to write {}: {e}", path.display());
+        std::process::exit(1);
+    }
+
+    let hash = hash_samples(&samples);
+    println!(
+        "wrote {} ({} bytes, {} samples) hash=0x{hash:016x}",
+        path.display(),
+        wav_bytes.len(),
+        samples.len()
+    );
+}
+
 fn main() {
-    let (frames, out_dir, scene, golden) = parse_args();
+    let (frames, out_dir, scene, golden, wav) = parse_args();
+
+    if let Some(path) = wav {
+        run_wav(frames, &path);
+        return;
+    }
 
     match golden {
         GoldenMode::Write => {

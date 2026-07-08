@@ -125,6 +125,12 @@ pub struct Mixer {
     sample_clock: u64,
     /// Master gain applied before soft-clip.
     pub master: f32,
+    /// Group gain applied to voices `0..MUSIC_VOICE_BASE` (the SFX pool +
+    /// spin-hum voice) at mix time — see [`Mixer::set_group_gains`].
+    sfx_gain: f32,
+    /// Group gain applied to voices `MUSIC_VOICE_BASE..NUM_VOICES` (the
+    /// tracker's 4 channels) at mix time — see [`Mixer::set_group_gains`].
+    music_gain: f32,
 }
 
 /// How often (in samples) frequency sweeps are re-applied — see module docs
@@ -148,7 +154,26 @@ impl Mixer {
             voices: [Voice::silent(); NUM_VOICES],
             sample_clock: 0,
             master: 0.85,
+            sfx_gain: 1.0,
+            music_gain: 1.0,
         }
+    }
+
+    /// Volume-settings hook (SPEC §7's `music_vol`/`sfx_vol`, integer scale
+    /// zero to ten; main.rs converts to a `f32` fraction): scales voices
+    /// below `MUSIC_VOICE_BASE` (the SFX pool plus the spin-hum voice) by
+    /// `sfx`, and voices from `MUSIC_VOICE_BASE` up to `NUM_VOICES` (the
+    /// tracker's four channels) by `music`, applied per-sample in
+    /// [`Mixer::render`] before `master`/soft-clip. A pure `f32` multiply
+    /// keyed only on voice index — no wall-clock, no branching on anything
+    /// but the fixed group boundary — so this stays fully deterministic
+    /// (SPEC §5) and reproducible in headless WAV renders. Defaults to
+    /// `1.0`/`1.0` (see [`Mixer::new`]), so every pre-existing test/caller
+    /// that never calls this is unaffected (multiplying by `1.0` is an exact
+    /// no-op per IEEE-754).
+    pub fn set_group_gains(&mut self, sfx: f32, music: f32) {
+        self.sfx_gain = sfx;
+        self.music_gain = music;
     }
 
     pub fn sample_clock(&self) -> u64 {
@@ -231,9 +256,14 @@ impl Mixer {
             }
 
             let mut sum = 0.0f32;
-            for v in self.voices.iter_mut() {
+            for (idx, v) in self.voices.iter_mut().enumerate() {
                 if v.active {
-                    sum += v.render_sample();
+                    let group_gain = if idx < MUSIC_VOICE_BASE {
+                        self.sfx_gain
+                    } else {
+                        self.music_gain
+                    };
+                    sum += v.render_sample() * group_gain;
                 }
             }
             sum *= self.master;
@@ -378,6 +408,46 @@ mod tests {
             let widened = s as i32;
             assert!(widened.abs() <= i16::MAX as i32, "sample {s} overflowed");
         }
+    }
+
+    /// [`Mixer::set_group_gains`]: zeroing the SFX group must silence a
+    /// pool-allocated voice while a tracker-channel voice (index
+    /// `>= MUSIC_VOICE_BASE`) at the same gain keeps sounding, and vice
+    /// versa — confirms the split is keyed on voice index at exactly
+    /// `MUSIC_VOICE_BASE`, not some blanket master-gain effect.
+    #[test]
+    fn group_gains_scale_only_their_own_voice_range() {
+        let mut mixer = Mixer::new();
+        mixer.trigger(params(200)); // lands in the SFX pool (index 0).
+        mixer.trigger_at(MUSIC_VOICE_BASE, params(200)); // a tracker channel.
+
+        mixer.set_group_gains(0.0, 1.0);
+        let mut buf = [0i16; 4];
+        mixer.render(&mut buf);
+        // Voice 0 (SFX) contributes nothing; voice MUSIC_VOICE_BASE (music)
+        // still sounds, so the mix isn't silent.
+        assert!(buf.iter().any(|&s| s != 0), "music group was wrongly muted");
+
+        // Fresh mixer, opposite split: SFX audible, music muted.
+        let mut mixer2 = Mixer::new();
+        mixer2.trigger(params(200));
+        mixer2.set_group_gains(1.0, 0.0);
+        let mut buf_sfx_only = [0i16; 4];
+        mixer2.render(&mut buf_sfx_only);
+        assert!(
+            buf_sfx_only.iter().any(|&s| s != 0),
+            "SFX group was wrongly muted"
+        );
+
+        let mut mixer3 = Mixer::new();
+        mixer3.trigger_at(MUSIC_VOICE_BASE, params(200));
+        mixer3.set_group_gains(1.0, 0.0);
+        let mut buf_music_muted = [0i16; 4];
+        mixer3.render(&mut buf_music_muted);
+        assert!(
+            buf_music_muted.iter().all(|&s| s == 0),
+            "music group should be fully silent at gain 0.0"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Win32 backend: window, GDI blit, input, timing, (later) waveOut.
+//! Win32 backend: window, GDI blit, input, timing, waveOut ring (Task M6-B).
 //! The only file in the project allowed to contain unsafe code (SPEC C8).
 //!
 //! Field/parameter/type names below intentionally mirror the Win32 API's own
@@ -6,6 +6,7 @@
 //! file can be cross-referenced directly against MSDN; that's what the
 //! blanket allows below are for.
 #![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms)]
 
 use std::ffi::c_void;
@@ -34,6 +35,16 @@ type LONG = i32;
 type BOOL = i32;
 type LPCWSTR = *const u16;
 type LPVOID = *mut c_void;
+
+// ---- waveOut (Task M6-B) ---------------------------------------------------
+/// Opaque waveOut device handle.
+type HWAVEOUT = *mut c_void;
+/// `UINT_PTR`/`DWORD_PTR`: pointer-sized on every ABI winmm.dll ships for,
+/// which on `x86_64-pc-windows-gnu` (SPEC C2) is exactly `usize`.
+type UINT_PTR = usize;
+type DWORD_PTR = usize;
+/// `MMRESULT` is a plain `UINT` return code (`MMSYSERR_*`/`WAVERR_*`).
+type MMRESULT = u32;
 
 type WNDPROC = extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT;
 
@@ -90,6 +101,33 @@ struct BITMAPINFOHEADER {
     biClrImportant: DWORD,
 }
 
+/// `WAVEFORMATEX` (winmm.h), PCM case (`cbSize` unused, kept 0).
+#[repr(C)]
+struct WAVEFORMATEX {
+    wFormatTag: WORD,
+    nChannels: WORD,
+    nSamplesPerSec: DWORD,
+    nAvgBytesPerSec: DWORD,
+    nBlockAlign: WORD,
+    wBitsPerSample: WORD,
+    cbSize: WORD,
+}
+
+/// `WAVEHDR` (winmm.h). Its address must stay stable for as long as it is
+/// `WHDR_PREPARED`/queued — see `AudioBuffer`'s doc comment for how this file
+/// guarantees that.
+#[repr(C)]
+struct WAVEHDR {
+    lpData: *mut u8,
+    dwBufferLength: DWORD,
+    dwBytesRecorded: DWORD,
+    dwUser: DWORD_PTR,
+    dwFlags: DWORD,
+    dwLoops: DWORD,
+    lpNext: *mut WAVEHDR,
+    reserved: DWORD_PTR,
+}
+
 // ---------------------------------------------------------------------------
 // Constants (only what's actually used below).
 // ---------------------------------------------------------------------------
@@ -125,6 +163,22 @@ const COLORONCOLOR: i32 = 3;
 
 /// Virtual-key code for Escape (main's quit key).
 pub const VK_ESCAPE: u8 = 0x1B;
+
+// ---- waveOut (Task M6-B; SPEC §8) ------------------------------------------
+
+/// `(UINT)-1` widened to `UINT_PTR`: "let the driver pick the default
+/// device", passed as `waveOutOpen`'s device-ID argument.
+const WAVE_MAPPER: UINT_PTR = 0xFFFF_FFFF;
+/// No callback function/window/thread/event (HARD RULES: single-threaded,
+/// polling only — `WHDR_DONE` is checked from the main loop, never a
+/// callback).
+const CALLBACK_NULL: DWORD = 0x0000_0000;
+const WAVE_FORMAT_PCM: WORD = 1;
+const MMSYSERR_NOERROR: MMRESULT = 0;
+/// Set once `waveOutWrite` has finished playing a buffer — this is the flag
+/// `AudioRing::free_count`/`submit` poll from the main loop (HARD RULES: no
+/// callback, no event handle; plain polling).
+const WHDR_DONE: DWORD = 0x0000_0001;
 
 // ---------------------------------------------------------------------------
 // extern "system" FFI surface. Only what's used is declared (per SPEC C8).
@@ -202,6 +256,20 @@ extern "system" {
 extern "system" {
     fn timeBeginPeriod(uPeriod: UINT) -> UINT;
     fn timeEndPeriod(uPeriod: UINT) -> UINT;
+
+    fn waveOutOpen(
+        phwo: *mut HWAVEOUT,
+        uDeviceID: UINT_PTR,
+        pwfx: *const WAVEFORMATEX,
+        dwCallback: DWORD_PTR,
+        dwInstance: DWORD_PTR,
+        fdwOpen: DWORD,
+    ) -> MMRESULT;
+    fn waveOutPrepareHeader(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
+    fn waveOutUnprepareHeader(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
+    fn waveOutWrite(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
+    fn waveOutReset(hwo: HWAVEOUT) -> MMRESULT;
+    fn waveOutClose(hwo: HWAVEOUT) -> MMRESULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,18 +306,185 @@ fn to_wstring(s: &str) -> Vec<u16> {
 }
 
 // ---------------------------------------------------------------------------
+// waveOut ring (Task M6-B; SPEC §8 / HARD RULES).
+//
+// Design: `AUDIO_RING_BUFFERS` (4) buffers of `AUDIO_BUFFER_FRAMES` (1024)
+// stereo frames each (~23.2ms/buffer @44.1kHz => ~93ms worst-case queued
+// latency), each `waveOutPrepareHeader`'d exactly ONCE at `AudioRing::open`
+// and then recycled forever via repeated `waveOutWrite` calls on the same
+// still-prepared `WAVEHDR` (a standard waveOut ring technique — re-preparing
+// per write is unnecessary and would be wasted work every frame). No
+// callback, no dedicated thread, no event handle (CALLBACK_NULL): the main
+// loop polls each header's `WHDR_DONE` bit once a frame and only refills/
+// requeues buffers that have actually finished playing.
+//
+// Buffer memory (`AudioBuffer::data`, a `Vec<i16>`) is heap-allocated once at
+// `AudioRing::open` and never resized afterward, so the raw pointer stashed
+// in `hdr.lpData` stays valid even though the owning `AudioBuffer`/`AudioRing`
+// /`Platform` values themselves may move (moving a `Vec`'s `(ptr,len,cap)`
+// header does not move its heap-allocated backing storage).
+// ---------------------------------------------------------------------------
+
+/// Ring buffer count (module docs above).
+pub const AUDIO_RING_BUFFERS: usize = 4;
+/// Stereo FRAMES (one L+R sample pair) per ring buffer (module docs above).
+pub const AUDIO_BUFFER_FRAMES: usize = 1024;
+
+const AUDIO_CHANNELS: WORD = 2;
+const AUDIO_BITS_PER_SAMPLE: WORD = 16;
+/// Fixed mono sample rate (SPEC §8; mirrors `floppy_audio::SAMPLE_RATE`).
+/// Hardcoded rather than threaded through from that crate so this
+/// unsafe-only file stays a plain wire-format layer, not an `floppy_audio`
+/// API consumer.
+const AUDIO_SAMPLE_RATE: DWORD = 44_100;
+
+/// One ring slot: its sample storage plus the `WAVEHDR` Windows keeps a
+/// pointer to while queued. `queued` tracks "has this buffer ever been
+/// submitted" — needed because a fresh, never-written buffer has `dwFlags ==
+/// WHDR_PREPARED` (no `WHDR_DONE` bit) despite also being available, and the
+/// free-space test below needs to treat both cases as "free" alike.
+struct AudioBuffer {
+    data: Vec<i16>,
+    hdr: WAVEHDR,
+    queued: bool,
+}
+
+impl AudioBuffer {
+    fn is_free(&self) -> bool {
+        !self.queued || (self.hdr.dwFlags & WHDR_DONE) != 0
+    }
+}
+
+/// The waveOut playback ring. `hwo.is_null()` means "no audio device" (either
+/// never opened or `waveOutOpen` failed) — every method is then a silent
+/// no-op, so the game still runs (silently) rather than crashing or hanging
+/// (module brief: graceful degradation).
+struct AudioRing {
+    hwo: HWAVEOUT,
+    buffers: Vec<AudioBuffer>,
+}
+
+impl AudioRing {
+    /// The not-yet-opened state: `Platform::init` constructs this; nothing
+    /// touches winmm until `Platform::audio_init` is called.
+    fn closed() -> AudioRing {
+        AudioRing {
+            hwo: ptr::null_mut(),
+            buffers: Vec::new(),
+        }
+    }
+
+    /// Opens the default waveOut device at [`AUDIO_SAMPLE_RATE`]/16-bit/
+    /// stereo and prepares [`AUDIO_RING_BUFFERS`] buffers once each. Any
+    /// failure (no device, format rejected, ...) yields the same `closed()`
+    /// no-op state instead of propagating an error — there is no sim-visible
+    /// consequence to running with audio off (HARD RULES: audio never writes
+    /// anything sim-visible).
+    fn open() -> AudioRing {
+        let block_align = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
+        let wfx = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM,
+            nChannels: AUDIO_CHANNELS,
+            nSamplesPerSec: AUDIO_SAMPLE_RATE,
+            nAvgBytesPerSec: AUDIO_SAMPLE_RATE * block_align as DWORD,
+            nBlockAlign: block_align,
+            wBitsPerSample: AUDIO_BITS_PER_SAMPLE,
+            cbSize: 0,
+        };
+
+        let mut hwo: HWAVEOUT = ptr::null_mut();
+        let result = unsafe { waveOutOpen(&mut hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) };
+        if result != MMSYSERR_NOERROR || hwo.is_null() {
+            return AudioRing::closed();
+        }
+
+        let mut buffers = Vec::with_capacity(AUDIO_RING_BUFFERS);
+        for _ in 0..AUDIO_RING_BUFFERS {
+            let mut data = vec![0i16; AUDIO_BUFFER_FRAMES * 2];
+            let mut hdr = WAVEHDR {
+                lpData: data.as_mut_ptr() as *mut u8,
+                dwBufferLength: (data.len() * size_of::<i16>()) as DWORD,
+                dwBytesRecorded: 0,
+                dwUser: 0,
+                dwFlags: 0,
+                dwLoops: 0,
+                lpNext: ptr::null_mut(),
+                reserved: 0,
+            };
+            unsafe {
+                waveOutPrepareHeader(hwo, &mut hdr, size_of::<WAVEHDR>() as UINT);
+            }
+            buffers.push(AudioBuffer {
+                data,
+                hdr,
+                queued: false,
+            });
+        }
+
+        AudioRing { hwo, buffers }
+    }
+
+    /// Ring slots currently free to accept a fresh `AUDIO_BUFFER_FRAMES`-long
+    /// mono chunk (0 with no audio device).
+    fn free_count(&self) -> usize {
+        self.buffers.iter().filter(|b| b.is_free()).count()
+    }
+
+    /// Duplicate `mono` (must be exactly `AUDIO_BUFFER_FRAMES` samples; SPEC
+    /// §8: "mono mixer output duplicated L=R at submit time") into the next
+    /// free ring slot and queue it with `waveOutWrite`. A silent no-op if
+    /// there is no free slot (the caller is expected to have checked
+    /// `free_count` first) or no audio device.
+    fn submit(&mut self, mono: &[i16]) {
+        if self.hwo.is_null() {
+            return;
+        }
+        debug_assert_eq!(mono.len(), AUDIO_BUFFER_FRAMES);
+        let Some(buf) = self.buffers.iter_mut().find(|b| b.is_free()) else {
+            return;
+        };
+        for (i, &s) in mono.iter().enumerate() {
+            buf.data[i * 2] = s;
+            buf.data[i * 2 + 1] = s;
+        }
+        buf.queued = true;
+        unsafe {
+            waveOutWrite(self.hwo, &mut buf.hdr, size_of::<WAVEHDR>() as UINT);
+        }
+    }
+
+    /// `waveOutReset` (stop + mark every buffer done) -> `UnprepareHeader`
+    /// each buffer -> `waveOutClose`, in that order — the order the Windows
+    /// docs prescribe to avoid a hang (module brief). A no-op with no device.
+    fn shutdown(&mut self) {
+        if self.hwo.is_null() {
+            return;
+        }
+        unsafe {
+            waveOutReset(self.hwo);
+            for buf in &mut self.buffers {
+                waveOutUnprepareHeader(self.hwo, &mut buf.hdr, size_of::<WAVEHDR>() as UINT);
+            }
+            waveOutClose(self.hwo);
+        }
+        self.hwo = ptr::null_mut();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public safe API.
 // ---------------------------------------------------------------------------
 
-/// Owns the Win32 window, its device context, key state, and timing. All
-/// unsafe FFI is contained in this module (SPEC C8); every method below is a
-/// safe fn.
+/// Owns the Win32 window, its device context, key state, timing, and the
+/// waveOut playback ring. All unsafe FFI is contained in this module (SPEC
+/// C8); every method below is a safe fn.
 pub struct Platform {
     hwnd: HWND,
     hdc: HDC,
     keys: [bool; 256],
     quit: bool,
     qpc_freq: f64,
+    audio: AudioRing,
 }
 
 impl Platform {
@@ -327,8 +562,29 @@ impl Platform {
                 keys: [false; 256],
                 quit: false,
                 qpc_freq: freq as f64,
+                audio: AudioRing::closed(),
             }
         }
+    }
+
+    /// Opens the waveOut ring (module docs above `AudioRing`). Call once
+    /// after `init`. Safe to call even if no audio device is present — the
+    /// ring degrades to a silent no-op path and the game still runs.
+    pub fn audio_init(&mut self) {
+        self.audio = AudioRing::open();
+    }
+
+    /// Ring slots currently free to accept a fresh [`AUDIO_BUFFER_FRAMES`]
+    /// -long mono chunk (0 if `audio_init` was never called, or no device).
+    pub fn audio_free_buffers(&mut self) -> usize {
+        self.audio.free_count()
+    }
+
+    /// Submit one [`AUDIO_BUFFER_FRAMES`]-length mono chunk: duplicated to
+    /// interleaved stereo and queued via `waveOutWrite` (SPEC §8). No-op if
+    /// there is no free ring slot or no audio device.
+    pub fn audio_submit(&mut self, mono: &[i16]) {
+        self.audio.submit(mono);
     }
 
     /// Drains the message queue, updating key state from WM_KEYDOWN/UP and
@@ -423,6 +679,10 @@ impl Platform {
 
 impl Drop for Platform {
     fn drop(&mut self) {
+        // Tear down audio first (module docs on `AudioRing::shutdown`: reset
+        // -> unprepare -> close, avoids a driver hang) — independent of the
+        // window teardown below, order between the two doesn't matter.
+        self.audio.shutdown();
         unsafe {
             timeEndPeriod(1);
             ReleaseDC(self.hwnd, self.hdc);
