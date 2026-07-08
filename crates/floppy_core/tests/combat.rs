@@ -305,7 +305,12 @@ fn parry_window_is_frame_precise() {
     );
 }
 
-/// Anchor reduces incoming knockback versus an unanchored baseline.
+/// Anchor reduces incoming knockback versus an unanchored baseline, once
+/// held PAST the 6-step startup window (FIX 2, M4 verifier: Anchor's
+/// benefits — this resistance among them — no longer apply from the first
+/// held step; see `anchor_knockback_resistance_only_applies_past_the_startup_window`
+/// below for the frame-precise startup-boundary test this one used to hide
+/// before that fix).
 #[test]
 fn anchor_resists_knockback_versus_baseline() {
     let stats = keystone_stats();
@@ -339,7 +344,8 @@ fn anchor_resists_knockback_versus_baseline() {
         ..NO_INPUT
     };
 
-    let mut anchored = make_pair(3);
+    // anchor_hold: 9 -> 10 this step, well past `anchor_startup_steps` (6).
+    let mut anchored = make_pair(9);
     anchored.step([input_anchor, NO_INPUT]);
     let anchored_speed = Vec2::new(anchored.tops[0].vel.x, anchored.tops[0].vel.z).length();
 
@@ -350,6 +356,223 @@ fn anchor_resists_knockback_versus_baseline() {
     assert!(
         anchored_speed < baseline_speed,
         "anchored={anchored_speed} baseline={baseline_speed}"
+    );
+}
+
+/// FIX 2 (M4 verifier): Anchor's knockback resistance applies only once
+/// `anchor_hold` exceeds `anchor_startup_steps` (6) — the movement penalty
+/// is unconditional from the first held step (you're rooted the moment you
+/// commit), but the DEFENSIVE benefit is not. Frame-precise, mirroring
+/// `parry_window_is_frame_precise`'s style: a hit landing at held-step 3
+/// (mid-startup) takes essentially full knockback; the same setup at
+/// held-step 8 (past startup) takes the full x0.2 reduction.
+#[test]
+fn anchor_knockback_resistance_only_applies_past_the_startup_window() {
+    let stats = keystone_stats();
+    let make_pair = |anchor_hold_before_step: u16| {
+        let combat0 = CombatState {
+            anchor_hold: anchor_hold_before_step,
+            ..CombatState::default()
+        };
+        let top0 = make_top(
+            Vec3::new(0.0, arena::height(0.0, 0.0), 0.0),
+            Vec3::default(),
+            8000.0,
+            1,
+            true,
+            stats,
+            combat0,
+        );
+        let top1 = make_top(
+            Vec3::new(0.5, arena::height(0.5, 0.0), 0.0),
+            Vec3::new(-5.0, 0.0, 0.0),
+            8000.0,
+            1,
+            true,
+            stats,
+            CombatState::default(),
+        );
+        world_with(top0, top1)
+    };
+    let input_anchor = InputState {
+        anchor: true,
+        ..NO_INPUT
+    };
+
+    let mut baseline = make_pair(0);
+    baseline.step([NO_INPUT, NO_INPUT]);
+    let baseline_speed = Vec2::new(baseline.tops[0].vel.x, baseline.tops[0].vel.z).length();
+
+    // anchor_hold: 2 -> 3 this step (mid-startup, startup=6): essentially
+    // full knockback, same order of magnitude as the unanchored baseline.
+    let mut at3 = make_pair(2);
+    at3.step([input_anchor, NO_INPUT]);
+    assert_eq!(at3.tops[0].combat.anchor_hold, 3);
+    let speed_at3 = Vec2::new(at3.tops[0].vel.x, at3.tops[0].vel.z).length();
+    assert!(
+        (speed_at3 - baseline_speed).abs() < baseline_speed * 0.05,
+        "mid-startup anchor should take ~full knockback: at3={speed_at3} baseline={baseline_speed}"
+    );
+
+    // anchor_hold: 7 -> 8 this step (past the 6-step startup): the full
+    // x0.2 reduction applies.
+    let mut at8 = make_pair(7);
+    at8.step([input_anchor, NO_INPUT]);
+    assert_eq!(at8.tops[0].combat.anchor_hold, 8);
+    let speed_at8 = Vec2::new(at8.tops[0].vel.x, at8.tops[0].vel.z).length();
+    assert!(
+        speed_at8 < speed_at3 * 0.5,
+        "past-startup anchor should resist knockback much more: at8={speed_at8} at3={speed_at3}"
+    );
+}
+
+/// FIX 1 (M4 verifier): Anchor's auto-break check must read the STRUCTURAL
+/// terrain gradient (basin + wall only), not the full gradient with its
+/// decorative ridge/cross-hill terms. Held continuously at r=5.0 — well out
+/// in the basin, and deliberately NOT the gradient-guarded center point
+/// (0,0) `anchor_resists_knockback_versus_baseline` sits at, which hides
+/// this bug entirely since the gradient is zero there regardless — Anchor
+/// must survive 120 steps with zero AnchorBreak events, and its knockback
+/// resistance (once past the 6-step startup) must measurably apply versus
+/// an unanchored baseline at the same radius: the actual gameplay promise
+/// this fix restores ("Anchor survives knockback/ring-out pushes near the
+/// rim", game_design.md §2).
+#[test]
+fn anchor_survives_mid_basin_slope_at_r5_with_no_breaks_and_resists_knockback() {
+    let stats = keystone_stats();
+    let r0 = 5.0_f32;
+    let input_anchor = InputState {
+        anchor: true,
+        ..NO_INPUT
+    };
+
+    // Part 1: hold anchor continuously for 120 steps at r=5; must never
+    // break. Companion dummy in a genuine orbit near the center (mirroring
+    // physics_invariants.rs's `orbit_dummy` pattern) so nothing rolls into a
+    // confounding collision with the anchored top.
+    let top0 = make_top(
+        Vec3::new(r0, arena::height(r0, 0.0), 0.0),
+        Vec3::default(),
+        8000.0,
+        1,
+        true,
+        stats,
+        CombatState::default(),
+    );
+    let omega = 0.748_331_5_f32; // sqrt(0.56), matches physics_invariants.rs's orbit_dummy derivation.
+    let dummy_r = 2.6f32;
+    let dummy = make_top(
+        Vec3::new(dummy_r, arena::height(dummy_r, 0.0), 0.0),
+        Vec3::new(0.0, 0.0, omega * dummy_r),
+        TUNE.spin_max,
+        1,
+        true,
+        stats,
+        CombatState::default(),
+    );
+    let mut world = world_with(top0, dummy);
+    for step in 0..120 {
+        world.step([input_anchor, NO_INPUT]);
+        assert!(
+            !world
+                .events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::AnchorBreak { who: 0 })),
+            "anchor broke at step {step} holding at r={r0}"
+        );
+    }
+    assert!(
+        world.tops[0].combat.anchor_hold > TUNE.anchor_startup_steps as u16,
+        "anchor should still be held after 120 steps, hold={}",
+        world.tops[0].combat.anchor_hold
+    );
+
+    // Part 2: past-startup knockback resistance at the same radius, versus
+    // an unanchored baseline.
+    let make_pair = |anchor_hold_before_step: u16| {
+        let combat0 = CombatState {
+            anchor_hold: anchor_hold_before_step,
+            ..CombatState::default()
+        };
+        let top0 = make_top(
+            Vec3::new(r0, arena::height(r0, 0.0), 0.0),
+            Vec3::default(),
+            8000.0,
+            1,
+            true,
+            stats,
+            combat0,
+        );
+        let top1 = make_top(
+            Vec3::new(r0 + 0.5, arena::height(r0 + 0.5, 0.0), 0.0),
+            Vec3::new(-5.0, 0.0, 0.0),
+            8000.0,
+            1,
+            true,
+            stats,
+            CombatState::default(),
+        );
+        world_with(top0, top1)
+    };
+    let mut anchored = make_pair(9); // -> 10 after this step's increment
+    anchored.step([input_anchor, NO_INPUT]);
+    let anchored_speed = Vec2::new(anchored.tops[0].vel.x, anchored.tops[0].vel.z).length();
+
+    let mut baseline = make_pair(0);
+    baseline.step([NO_INPUT, NO_INPUT]);
+    let baseline_speed = Vec2::new(baseline.tops[0].vel.x, baseline.tops[0].vel.z).length();
+
+    assert!(
+        anchored_speed < baseline_speed,
+        "anchored={anchored_speed} baseline={baseline_speed}"
+    );
+}
+
+/// FIX 1 (M4 verifier): past the wall base (r=8.0, well inside the cubic
+/// wall band), Anchor's structural-slope auto-break must still fire —
+/// Anchor cannot be used to turtle ON the wall.
+#[test]
+fn anchor_breaks_quickly_on_the_wall_at_r8() {
+    let stats = keystone_stats();
+    let r0 = 8.0_f32;
+    let input_anchor = InputState {
+        anchor: true,
+        ..NO_INPUT
+    };
+    let top0 = make_top(
+        Vec3::new(r0, arena::height(r0, 0.0), 0.0),
+        Vec3::default(),
+        8000.0,
+        1,
+        true,
+        stats,
+        CombatState::default(),
+    );
+    let dummy = make_top(
+        Vec3::new(-r0, arena::height(-r0, 0.0), 0.0),
+        Vec3::default(),
+        8000.0,
+        1,
+        true,
+        stats,
+        CombatState::default(),
+    );
+    let mut world = world_with(top0, dummy);
+    let mut broke = false;
+    for _ in 0..8 {
+        world.step([input_anchor, NO_INPUT]);
+        if world
+            .events
+            .iter()
+            .any(|e| matches!(e, BattleEvent::AnchorBreak { who: 0 }))
+        {
+            broke = true;
+            break;
+        }
+    }
+    assert!(
+        broke,
+        "anchor should auto-break within a few held steps at r={r0}"
     );
 }
 
@@ -973,6 +1196,76 @@ fn sinkhole_pulls_the_opponent_more_than_terrain_slope_alone() {
     );
 }
 
+/// FIX 4 (M4 verifier): airborne tops are immune to Sinkhole's pull
+/// (game_design.md §2: airborne tops are "immune to ground-tracking
+/// effects" — this is what makes Hop the correct escape read against
+/// Sinkhole). An airborne victim's velocity must be BIT-IDENTICAL with and
+/// without the opponent's Sinkhole active; a grounded victim at the same
+/// offset is measurably pulled.
+#[test]
+fn sinkhole_does_not_pull_an_airborne_victim_but_pulls_a_grounded_one() {
+    let stats = keystone_stats();
+    let make_pair = |sinkhole_active: bool, victim_grounded: bool| {
+        let mut owner_combat = CombatState::default();
+        if sinkhole_active {
+            owner_combat.special_id = SpecialId::Sinkhole;
+            owner_combat.special_active = 10;
+        }
+        let owner = make_top(
+            Vec3::new(0.0, arena::height(0.0, 0.0), 0.0),
+            Vec3::default(),
+            8000.0,
+            1,
+            true,
+            stats,
+            owner_combat,
+        );
+        // Offset 2.0 m: inside the 2.4 m pull radius, but far enough that
+        // the collision spheres (sum radius 1.9 m) never overlap, so a
+        // confounding collision impulse can't contaminate the velocity
+        // comparison.
+        let ground_y = arena::height(2.0, 0.0);
+        let victim_y = if victim_grounded {
+            ground_y
+        } else {
+            ground_y + 2.0
+        };
+        let victim = make_top(
+            Vec3::new(2.0, victim_y, 0.0),
+            Vec3::default(),
+            8000.0,
+            1,
+            victim_grounded,
+            stats,
+            CombatState::default(),
+        );
+        world_with(owner, victim)
+    };
+
+    // Airborne: bit-identical velocity with and without Sinkhole.
+    let mut air_with = make_pair(true, false);
+    air_with.step([NO_INPUT, NO_INPUT]);
+    let mut air_without = make_pair(false, false);
+    air_without.step([NO_INPUT, NO_INPUT]);
+    assert_eq!(
+        air_with.tops[1].vel, air_without.tops[1].vel,
+        "an airborne victim must be bit-identically unaffected by an opponent's Sinkhole"
+    );
+
+    // Grounded: measurably pulled toward the owner (negative x: owner is at
+    // x=0, victim at x=2.0, so the pull points toward -x).
+    let mut ground_with = make_pair(true, true);
+    ground_with.step([NO_INPUT, NO_INPUT]);
+    let mut ground_without = make_pair(false, true);
+    ground_without.step([NO_INPUT, NO_INPUT]);
+    assert!(
+        ground_with.tops[1].vel.x < ground_without.tops[1].vel.x,
+        "a grounded victim should be pulled toward the owner: with={} without={}",
+        ground_with.tops[1].vel.x,
+        ground_without.tops[1].vel.x
+    );
+}
+
 #[test]
 fn riposte_negates_the_hit_and_reverses_it_onto_the_attacker() {
     let stats = keystone_stats();
@@ -1019,6 +1312,69 @@ fn riposte_negates_the_hit_and_reverses_it_onto_the_attacker() {
         .events
         .iter()
         .any(|e| matches!(e, BattleEvent::SpecialHit { who: 0 })));
+}
+
+/// FIX 6 (M4 verifier, tests-only): Riposte fizzle regression — an active
+/// Riposte window that expires WITHOUT ever triggering (no incoming hit)
+/// refunds `special_riposte_fizzle_refund` (30) meter on the step it
+/// closes (game_design.md §3: "fizzle refunds 30 meter").
+#[test]
+fn riposte_fizzle_refunds_30_meter_on_expiry_with_no_incoming_hit() {
+    let stats = keystone_stats();
+    let combat0 = CombatState {
+        special_id: SpecialId::Riposte,
+        special_active: 1,   // about to expire THIS step
+        special_flag: false, // never triggered
+        ..CombatState::default()
+    };
+    let top0 = make_top(
+        Vec3::new(-3.0, arena::height(-3.0, 0.0), 0.0),
+        Vec3::default(),
+        8000.0,
+        1,
+        true,
+        stats,
+        combat0,
+    );
+    // Far enough apart that no collision happens this step — isolating the
+    // fizzle refund from any drain-based meter gain.
+    let top1 = make_top(
+        Vec3::new(3.0, arena::height(3.0, 0.0), 0.0),
+        Vec3::default(),
+        8000.0,
+        1,
+        true,
+        stats,
+        CombatState::default(),
+    );
+    let mut world = world_with(top0, top1);
+    world.tops[0].meter = 10.0;
+    let meter_before = world.tops[0].meter;
+
+    world.step([NO_INPUT, NO_INPUT]);
+
+    assert_eq!(
+        world.tops[0].combat.special_active, 0,
+        "riposte should have expired this step"
+    );
+    assert!(
+        !world
+            .events
+            .iter()
+            .any(|e| matches!(e, BattleEvent::Hit { .. })),
+        "no collision should have occurred this step"
+    );
+    let delta = world.tops[0].meter - meter_before;
+    // A hair over exactly +30: Phase 7's passive trickle also applies later
+    // in the SAME step (same documented same-step-stacking behavior as
+    // `special_fire_opens_a_144_step_crash_out_window`'s "meter should be
+    // ~zero right after firing" comment), so allow a small margin above the
+    // refund itself rather than asserting bit-exact equality.
+    assert!(
+        (delta - TUNE.special_riposte_fizzle_refund).abs() < 0.1,
+        "expected a ~+{} meter fizzle refund, got delta={delta}",
+        TUNE.special_riposte_fizzle_refund
+    );
 }
 
 #[test]
@@ -1232,6 +1588,17 @@ fn scripted_verb_inputs(step: u32) -> [InputState; 2] {
     ]
 }
 
+/// FIX 3 (M4 verifier): under the scripted verb pressure below, meter never
+/// naturally reached 100 (max observed 42.9 over the full 2000-step run),
+/// so the special arm->fire->active->Crash-Out-window machinery was never
+/// actually exercised by this determinism test despite it pressing special
+/// every 7th phase. Both tops' meter is force-set to 100 right after spawn
+/// (guaranteeing the FIRST scripted special-press window fires) and again
+/// at step 1000, identically in both runs (guaranteeing a later window
+/// fires too, since natural regrowth after the first fire is far too slow
+/// to re-arm on its own by the time the next scripted window comes around)
+/// — so at least one full fire->active->window cycle happens per top, and
+/// the collected `SpecialFire` events prove the hole can't silently reopen.
 #[test]
 fn verb_heavy_scripted_2000_steps_is_deterministic() {
     let stats = keystone_stats();
@@ -1256,24 +1623,49 @@ fn verb_heavy_scripted_2000_steps_is_deterministic() {
                 special_id: SpecialId::Overclock,
             },
         ];
-        World::launch(99, params)
+        let mut world = World::launch(99, params);
+        world.tops[0].meter = 100.0;
+        world.tops[1].meter = 100.0;
+        world
     };
     let run = || {
         let mut world = make_world();
         let mut hashes = Vec::new();
+        let mut fired = [false, false];
         for s in 0..2000u32 {
             world.step(scripted_verb_inputs(s));
+            for ev in &world.events {
+                if let BattleEvent::SpecialFire { who } = ev {
+                    fired[*who as usize] = true;
+                }
+            }
+            // Re-arm mid-run, identically in both runs, so a SECOND
+            // fire->active->window cycle is exercised even though natural
+            // meter regrowth after the first fire never gets close to 100
+            // again within this run's step budget.
+            if s == 1000 {
+                world.tops[0].meter = 100.0;
+                world.tops[1].meter = 100.0;
+            }
             hashes.push(world.state_hash());
             if world.outcome.is_some() {
                 break;
             }
         }
-        hashes
+        (hashes, fired)
     };
-    let a = run();
-    let b = run();
+    let (a, fired_a) = run();
+    let (b, fired_b) = run();
     assert_eq!(a, b);
     assert!(a.windows(2).any(|w| w[0] != w[1]), "hashes never changed");
+    assert_eq!(
+        fired_a, fired_b,
+        "SpecialFire occurrence must be deterministic too"
+    );
+    assert!(
+        fired_a[0] || fired_a[1],
+        "expected at least one SpecialFire event over the scripted run"
+    );
 }
 
 // ---------------------------------------------------------------------------

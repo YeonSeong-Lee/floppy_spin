@@ -152,6 +152,16 @@ pub struct TuneParams {
     pub dash_shove_armor_threshold: f32,
 
     // ---- Guard (Z, held; game_design.md §2) ----
+    /// Declared (matches the design table's "startup 4") but deliberately
+    /// never compared against directly in `step_guard`/`defense_reduction`
+    /// — see `step_guard`'s doc comment: the 8-step parry window
+    /// (`guard_parry_window_steps`) already subsumes this whole startup, so
+    /// there is no separate "pressed but not yet protected" gap to gate a
+    /// benefit behind. This is NOT the same bug FIX 2 found in
+    /// `anchor_startup_steps` (which WAS silently never read at all,
+    /// letting Anchor's benefits apply from press step 1) — this field's
+    /// unread-ness is the documented, intentional consequence of the two
+    /// windows overlapping, not an oversight.
     pub guard_startup_steps: u32,
     pub guard_drop_recovery_steps: u32,
     pub guard_parry_window_steps: u32,
@@ -180,8 +190,7 @@ pub struct TuneParams {
     pub hop_slam_drain_cap: f32,
     /// Knockback scaling for the aerial slam: `1.0 + (drain/cap) *
     /// this_bonus` (game_design.md §2 says knockback is "likewise scaled"
-    /// without exact numbers — documented interpretation, see the milestone
-    /// report).
+    /// without exact numbers — documented interpretation).
     pub hop_slam_knock_bonus_at_cap: f32,
 
     // ---- Carve (C, held; game_design.md §2) ----
@@ -193,6 +202,18 @@ pub struct TuneParams {
     pub carve_release_decay_steps: u32,
 
     // ---- Anchor (Ctrl, held; game_design.md §2) ----
+    /// Steps `anchor_hold` must EXCEED before Anchor's benefits (knockback
+    /// ×`anchor_knock_mult`, slide ×`anchor_slide_mult`, tilt recovery,
+    /// spin regen) apply (FIX 2, M4 verifier: this was declared but never
+    /// read at all before, so every benefit applied from the first held
+    /// step). The move penalty (×`anchor_move_mult`) and the auto-break
+    /// check are NOT gated by this — you're rooted the moment you commit,
+    /// and committing onto a steep slope still snaps you, mirroring Guard's
+    /// existing "the cost leads the benefit" treatment (see `step_guard`'s
+    /// doc comment on why Guard's own startup field is unread for a
+    /// different, intentional reason). See `defense_reduction`,
+    /// `step_forces`, and `step_spin_and_precession` for the gated call
+    /// sites.
     pub anchor_startup_steps: u32,
     pub anchor_release_steps: u32,
     pub anchor_knock_mult: f32,
@@ -200,7 +221,25 @@ pub struct TuneParams {
     pub anchor_tilt_recovery_per_s: f32,
     pub anchor_spin_regen_per_s: f32,
     pub anchor_move_mult: f32,
-    /// `tan(12 degrees)`, precomputed offline (see `guard_slope_tan_threshold`).
+    /// `tan(21.8 degrees) ≈ 0.40`, precomputed offline (see
+    /// `guard_slope_tan_threshold`). FIX 1 (M4 verifier): the auto-break
+    /// check this gates now samples `arena::structural_gradient` (basin +
+    /// wall only, excluding the decorative ridge/cross-hill terms — see
+    /// that function's doc comment) instead of the full `arena::gradient`.
+    /// The design table originally said "slopes > 12°"
+    /// (`tan(12°) ≈ 0.2126`), authored before the bowl profile was
+    /// finalized: the basin term alone (`0.02·r²`) already reaches 12° at
+    /// r ≈ 5.3 m, which — even reading only the clean structural slope —
+    /// would still auto-break Anchor well short of the rim the design
+    /// explicitly promises it survives near ("Anchor survives
+    /// knockback/ring-out pushes near the rim", game_design.md §2). 0.40
+    /// pushes the structural break line onto the wall band instead (probed
+    /// empirically at r ≈ 7.49, comfortably past `WALL_START` = 7.0 — see
+    /// `tests/combat.rs`'s `anchor_*_at_r*`/`anchor_survives_mid_basin_*`
+    /// tests), so Anchor works throughout
+    /// the basin, including the near-rim approach where the escape read
+    /// matters, and only breaks once a top actually commits to the wall
+    /// proper (no turtling on the wall).
     pub anchor_break_slope_tan_threshold: f32,
 
     // ---- Meter economy (game_design.md §1/§2) ----
@@ -239,8 +278,22 @@ pub struct TuneParams {
     pub special_slipstream_steps: u16,
     pub special_slipstream_accel_mult: f32,
     pub special_slipstream_exit_knock_mult: f32,
+    /// Extra multiplier applied on TOP of `special_slipstream_exit_knock_mult`
+    /// when the exit hit lands as a backstab (game_design.md §3: "backstab
+    /// bonus only if exit angle > 90 degrees off defender facing" — the
+    /// design doc names the effect and its trigger condition but gives no
+    /// numeric value; `1.3` is an implementer-chosen number, not derived
+    /// from anything in the design draft).
     pub special_slipstream_backstab_bonus: f32,
 
+    // Sinkhole's force well (below) is the entire sim-side implementation
+    // (FIX 5, M4 verifier, docs-only). game_design.md §3 also describes a
+    // "local floor depression" — that's a render-side visual (never sim
+    // state: `arena::height`/`gradient` are pure functions of `(x, z)` with
+    // no per-top or per-special modifiers), cut as out of scope for the sim
+    // layer this milestone. If a later milestone wants the depression to
+    // visually read, it belongs in `floppy_render`, driven off
+    // `special_active`/owner position, not here.
     pub special_sinkhole_steps: u16,
     pub special_sinkhole_pull_accel: f32,
     pub special_sinkhole_radius: f32,
@@ -266,8 +319,7 @@ pub struct TuneParams {
     pub spin_angle_rate: f32,
 }
 
-/// Starting tuning values (task spec table). See the final report for any
-/// values adjusted after invariant-test tuning, with rationale.
+/// Starting tuning values (task spec table).
 pub const TUNE: TuneParams = TuneParams {
     gravity: 22.0,
     spin_max: 10_000.0,
@@ -364,7 +416,10 @@ pub const TUNE: TuneParams = TuneParams {
     anchor_tilt_recovery_per_s: 0.08,
     anchor_spin_regen_per_s: 150.0,
     anchor_move_mult: 0.1,
-    anchor_break_slope_tan_threshold: 0.212_556_56, // tan(12 deg)
+    // FIX 1 (M4 verifier): tan(21.8 deg) ~= 0.40, not tan(12 deg) — see the
+    // field's doc comment for the full rationale (structural-only slope
+    // reading, break line probed at r ~= 7.49, past WALL_START).
+    anchor_break_slope_tan_threshold: 0.40,
 
     meter_gain_scale_base: 0.7,
     meter_gain_scale_mtr: 0.6,
@@ -879,8 +934,7 @@ impl World {
     /// and a few steps beyond it, so there is no genuinely vulnerable
     /// "pressed but not yet parrying-or-blocking" gap — a documented reading
     /// of the design doc's two windows as overlapping rather than
-    /// sequential (see the milestone report). Airborne: cannot Guard
-    /// (game_design.md §2 Hop doc).
+    /// sequential. Airborne: cannot Guard (game_design.md §2 Hop doc).
     fn step_guard(&mut self, i: usize, input: InputState) {
         let top = &mut self.tops[i];
 
@@ -969,8 +1023,17 @@ impl World {
     }
 
     /// Anchor (Ctrl, held; game_design.md §2): auto-breaks (forced release)
-    /// on a slope steeper than 12 degrees. Airborne: cannot Anchor
-    /// (game_design.md §2 Hop doc).
+    /// on a STRUCTURAL slope steeper than ~21.8 degrees (FIX 1, M4
+    /// verifier — see `anchor_break_slope_tan_threshold`'s doc comment for
+    /// why 12 degrees and the full gradient were both wrong: decorative
+    /// ridge/cross-hill terrain must not drive this check, and the
+    /// design's original 12-degree figure would still break Anchor well
+    /// inside the basin even read cleanly). The auto-break check itself —
+    /// unlike Anchor's knockback/slide/tilt/regen benefits (FIX 2, gated
+    /// behind `anchor_startup_steps` at their own call sites) — is active
+    /// from the very first held step: committing Anchor onto a wall still
+    /// snaps it immediately, no startup grace period. Airborne: cannot
+    /// Anchor (game_design.md §2 Hop doc).
     fn step_anchor(&mut self, i: usize, input: InputState) {
         let top = &mut self.tops[i];
 
@@ -999,7 +1062,11 @@ impl World {
 
         top.combat.anchor_hold = top.combat.anchor_hold.saturating_add(1);
 
-        let (dhdx, dhdz) = arena::gradient(top.pos.x, top.pos.z);
+        // FIX 1 (M4 verifier): STRUCTURAL gradient (basin + wall only), not
+        // the full terrain gradient — see `arena::structural_gradient`'s
+        // doc comment. Sampling the full gradient here made Anchor
+        // auto-break in a ridge-noise patchwork across most of the arena.
+        let (dhdx, dhdz) = arena::structural_gradient(top.pos.x, top.pos.z);
         let slope = Vec2::new(dhdx, dhdz).length();
         if slope > TUNE.anchor_break_slope_tan_threshold {
             top.combat.anchor_hold = 0;
@@ -1015,8 +1082,7 @@ impl World {
     /// (independent timers, both decremented at the top of this same method
     /// next step — mirroring the existing `dash_cd`/`dash_active`
     /// decrement-then-assign-fresh pattern — so "kill inside 144 steps"
-    /// means exactly steps `fire_step ..= fire_step + 143`, see the
-    /// milestone report for the worked-out step-counting argument).
+    /// means exactly steps `fire_step ..= fire_step + 143`).
     fn step_special_fire(&mut self, i: usize, input: InputState) {
         {
             let top = &mut self.tops[i];
@@ -1113,8 +1179,14 @@ impl World {
             } else {
                 1.0
             };
-            // Anchor: downhill slide reduced to `anchor_slide_mult`.
-            let slide_mult = if top.combat.anchor_hold > 0 {
+            // Anchor: downhill slide reduced to `anchor_slide_mult`, gated
+            // behind the startup window (FIX 2, M4 verifier): this benefit
+            // only applies once `anchor_hold` exceeds `anchor_startup_steps`
+            // — a freshly-committed Anchor slides at the normal (unreduced)
+            // rate during its 6-step startup, same as every other Anchor
+            // benefit gated at its own call site (see
+            // `anchor_startup_steps`'s doc comment).
+            let slide_mult = if top.combat.anchor_hold > TUNE.anchor_startup_steps as u16 {
                 TUNE.anchor_slide_mult
             } else {
                 1.0
@@ -1125,10 +1197,19 @@ impl World {
             // Guard: extra downhill slide on slopes > 6 degrees
             // (game_design.md §2: "slides downhill x0.6 EXTRA" — documented
             // interpretation: an ADDITIONAL slope-accel term on top of the
-            // normal one above, while guard is held on a steep slope; see
-            // the milestone report).
-            let slope_mag = Vec2::new(dhdx, dhdz).length();
-            if top.combat.guard_hold > 0 && slope_mag > TUNE.guard_slope_tan_threshold {
+            // normal one above, while guard is held on a steep slope). FIX 1
+            // (M4 verifier): the steepness CHECK samples the STRUCTURAL
+            // gradient (basin + wall only — see `arena::structural_gradient`'s
+            // doc comment), not the full gradient above, so decorative
+            // ridge/cross-hill noise can't decide whether this extra slide
+            // triggers. Once triggered, the slide's own direction/magnitude
+            // still follows the full terrain gradient (`dhdx`/`dhdz`) like
+            // every other slope force here — only the trigger condition
+            // changes.
+            let (structural_dhdx, structural_dhdz) =
+                arena::structural_gradient(top.pos.x, top.pos.z);
+            let structural_slope_mag = Vec2::new(structural_dhdx, structural_dhdz).length();
+            if top.combat.guard_hold > 0 && structural_slope_mag > TUNE.guard_slope_tan_threshold {
                 top.vel.x += -dhdx * TUNE.slope_accel * TUNE.guard_slope_extra_mult * SIM_DT;
                 top.vel.z += -dhdz * TUNE.slope_accel * TUNE.guard_slope_extra_mult * SIM_DT;
             }
@@ -1158,8 +1239,17 @@ impl World {
         // Sinkhole: pull toward the OPPONENT if THEY have it active
         // (game_design.md §3: "self immune" — a top only ever reads its
         // OPPONENT'S Sinkhole state here, never its own, so the owner is
-        // never pulled toward itself by construction).
-        if opponent.combat.special_active > 0 && opponent.combat.special_id == SpecialId::Sinkhole {
+        // never pulled toward itself by construction). GROUNDED-ONLY (FIX 4,
+        // M4 verifier): game_design.md §2's Hop doc calls out that airborne
+        // tops are "immune to ground-tracking effects", and Sinkhole's pull
+        // is exactly such an effect — this is what makes Hop the correct
+        // escape read against Sinkhole rather than Anchor/Carve (the §2
+        // Crash-Out escape-verb table), and M5's AI reads this same
+        // grounded/airborne distinction to make that read.
+        if top.grounded
+            && opponent.combat.special_active > 0
+            && opponent.combat.special_id == SpecialId::Sinkhole
+        {
             let dx = opponent.pos.x - top.pos.x;
             let dz = opponent.pos.z - top.pos.z;
             let dist_sq = dx * dx + dz * dz;
@@ -1301,11 +1391,14 @@ impl World {
             top.spin -= 2.0;
         }
         // Guard: 90 spin/s while held. Anchor: +150 spin/s regen while held
-        // (game_design.md §2).
+        // (game_design.md §2), gated behind the startup window (FIX 2, M4
+        // verifier — see `anchor_startup_steps`'s doc comment): this is one
+        // of Anchor's BENEFITS, so it only applies once `anchor_hold`
+        // exceeds `anchor_startup_steps`.
         if top.combat.guard_hold > 0 {
             top.spin -= TUNE.guard_spin_cost_per_s * SIM_DT;
         }
-        if top.combat.anchor_hold > 0 {
+        if top.combat.anchor_hold > TUNE.anchor_startup_steps as u16 {
             top.spin += TUNE.anchor_spin_regen_per_s * SIM_DT;
         }
         top.spin = top.spin.clamp(0.0, TUNE.spin_max);
@@ -1355,8 +1448,10 @@ impl World {
         }
         .max(0.0);
 
-        // Anchor: extra flat tilt recovery, 0.08 rad/s (game_design.md §2).
-        if top.combat.anchor_hold > 0 {
+        // Anchor: extra flat tilt recovery, 0.08 rad/s (game_design.md §2),
+        // gated behind the startup window like the spin regen above (FIX 2,
+        // M4 verifier).
+        if top.combat.anchor_hold > TUNE.anchor_startup_steps as u16 {
             new_mag = (new_mag - TUNE.anchor_tilt_recovery_per_s * SIM_DT).max(0.0);
         }
 
@@ -1387,7 +1482,13 @@ impl World {
             knock *= TUNE.guard_knock_mult;
             drain *= TUNE.guard_drain_mult;
         }
-        if top.combat.anchor_hold > 0 {
+        // Anchor's knockback resistance is gated behind the startup window
+        // (FIX 2, M4 verifier — see `anchor_startup_steps`'s doc comment):
+        // it's a benefit, so it only applies once `anchor_hold` exceeds
+        // `anchor_startup_steps`, unlike the movement penalty (applied
+        // unconditionally elsewhere) and the auto-break check (also
+        // unconditional).
+        if top.combat.anchor_hold > TUNE.anchor_startup_steps as u16 {
             knock *= TUNE.anchor_knock_mult;
         }
         if top.combat.special_active > 0 && top.combat.special_id == SpecialId::AegisLock {
@@ -1424,6 +1525,9 @@ impl World {
         let backstab = facing_opp.dot(exit_dir) > 0.0;
         let mut mult = TUNE.special_slipstream_exit_knock_mult;
         if backstab {
+            // x1.3 (FIX 5, M4 verifier, docs-only): implementer-chosen — see
+            // `special_slipstream_backstab_bonus`'s doc comment, the design
+            // draft names the backstab bonus but gives no number.
             mult *= TUNE.special_slipstream_backstab_bonus;
         }
 

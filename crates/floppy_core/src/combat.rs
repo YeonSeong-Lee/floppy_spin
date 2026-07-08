@@ -226,8 +226,7 @@ impl CombatState {
 /// bonus to all six stats, Aegis Lock's DEF-100-equivalent (game_design.md
 /// §3). Read wherever `physics.rs` consults `top.stats` for a COMBAT
 /// calculation; NOT used for `Stats::mass` (Overclock/Aegis Lock don't claim
-/// to change WGT-derived momentum exchange — a deliberate scope trim,
-/// documented in the milestone report).
+/// to change WGT-derived momentum exchange — a deliberate scope trim).
 pub fn effective_stats(top: &Top) -> Stats {
     let mut s = top.stats;
     if top.combat.special_active > 0 {

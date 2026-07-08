@@ -81,6 +81,31 @@ pub fn height(x: f32, z: f32) -> f32 {
     basin + wall + ridges + cross
 }
 
+/// Analytic gradient of the basin term alone: `d/dx[0.02*(x^2+z^2)] =
+/// 0.04*x` (and symmetric in `z`), differentiated directly rather than
+/// through the chain-rule `r` form so it needs no division and stays exact
+/// (and perfectly well-defined) at the origin. Shared by [`gradient`] and
+/// [`structural_gradient`] so the two can never drift apart on this term.
+fn basin_gradient(x: f32, z: f32) -> (f32, f32) {
+    (2.0 * BASIN_COEFF * x, 2.0 * BASIN_COEFF * z)
+}
+
+/// Analytic gradient of the wall term alone, given the caller's
+/// already-computed radial derivative direction `(dr_dx, dr_dz)` (zeroed in
+/// the guarded neighborhood of the origin — see [`gradient`]'s doc
+/// comment). `d/dr[2.2*w^3] = 6.6*w^2 * dw/dr`, `dw/dr = 1/WALL_SPAN` for `r
+/// > WALL_START` (0 below, matching the `max(0, ..)` clamp's derivative).
+/// Shared by [`gradient`] and [`structural_gradient`].
+fn wall_gradient(r: f32, dr_dx: f32, dr_dz: f32) -> (f32, f32) {
+    let w = wall_w(r);
+    let dwall_dr = if r > WALL_START {
+        3.0 * WALL_COEFF * w * w / WALL_SPAN
+    } else {
+        0.0
+    };
+    (dwall_dr * dr_dx, dwall_dr * dr_dz)
+}
+
 /// Analytic `(dh/dx, dh/dz)` — the exact chain-rule derivative of
 /// [`height`], used to build the terrain normal for contact response.
 ///
@@ -97,21 +122,8 @@ pub fn gradient(x: f32, z: f32) -> (f32, f32) {
     // dr/dx, dr/dz — zero in the guarded neighborhood of the origin.
     let (dr_dx, dr_dz) = if r < 1e-4 { (0.0, 0.0) } else { (x / r, z / r) };
 
-    // Basin: 0.02*(x^2+z^2), differentiated directly (equivalent to the
-    // chain-rule form 0.04*r*(x/r) but avoids any r-division at all).
-    let basin_dx = 2.0 * BASIN_COEFF * x;
-    let basin_dz = 2.0 * BASIN_COEFF * z;
-
-    // Wall: d/dr[2.2*w^3] = 6.6*w^2 * dw/dr, dw/dr = 1/WALL_SPAN for r >
-    // WALL_START (0 below, matching the max(0, ..) clamp's derivative).
-    let w = wall_w(r);
-    let dwall_dr = if r > WALL_START {
-        3.0 * WALL_COEFF * w * w / WALL_SPAN
-    } else {
-        0.0
-    };
-    let wall_dx = dwall_dr * dr_dx;
-    let wall_dz = dwall_dr * dr_dz;
+    let (basin_dx, basin_dz) = basin_gradient(x, z);
+    let (wall_dx, wall_dz) = wall_gradient(r, dr_dx, dr_dz);
 
     // Ridges: 0.06*sin(4r)*env(r), product rule over r then chain to x/z.
     let env = envelope(r);
@@ -136,6 +148,33 @@ pub fn gradient(x: f32, z: f32) -> (f32, f32) {
         basin_dx + wall_dx + ridges_dx + cross_dx,
         basin_dz + wall_dz + ridges_dz + cross_dz,
     )
+}
+
+/// Gradient of ONLY the basin + wall terms — the "structural" slope that is
+/// gameplay-legible steepness (basin bowl + outer wall). Deliberately
+/// EXCLUDES the decorative ridge/cross-hill terms that [`gradient`] (and
+/// [`height`]) include: their derivative amplitude (`RIDGE_AMPLITUDE *
+/// RIDGE_FREQ` alone is ~0.24) swamps the handful-of-degrees thresholds a
+/// gameplay verb check cares about almost everywhere the decoration is
+/// active, turning what should be smooth basin/wall geography into a
+/// patchwork of spurious steep readings.
+///
+/// Terrain contact, slope gravity, and Carve's climb bonus all still read
+/// the FULL [`gradient`] — ridges are real physical bumps a top rolls over
+/// and feels, and should stay that way. This function exists specifically
+/// for verb-viability geography that must stay gameplay-legible instead:
+/// Anchor's auto-break check and Guard's downhill-slide-extra check
+/// (`physics.rs`) sample this rather than `gradient`, per the M4 verifier's
+/// FIX 1 — the ridge/hill decoration stays purely physical flavor and must
+/// not drive which verbs work where.
+pub fn structural_gradient(x: f32, z: f32) -> (f32, f32) {
+    let r = fixmath::sqrt(x * x + z * z);
+    let (dr_dx, dr_dz) = if r < 1e-4 { (0.0, 0.0) } else { (x / r, z / r) };
+
+    let (basin_dx, basin_dz) = basin_gradient(x, z);
+    let (wall_dx, wall_dz) = wall_gradient(r, dr_dx, dr_dz);
+
+    (basin_dx + wall_dx, basin_dz + wall_dz)
 }
 
 /// Terrain normal at `(x, z)`: `normalize(-dh/dx, 1, -dh/dz)`, i.e. the
@@ -238,5 +277,48 @@ mod tests {
         let n = normal(5.0, 3.0);
         let len = n.length();
         assert!((len - 1.0).abs() < 1e-3, "len={len}");
+    }
+
+    /// FIX 1 (M4 verifier): `structural_gradient` must equal the analytic
+    /// basin-only derivative at a point deep in the basin (r=5, on the +x
+    /// axis so the cross-hill/ridge terms — which the full `gradient`
+    /// includes but this one must not — would otherwise be large and
+    /// obvious if they leaked in).
+    #[test]
+    fn structural_gradient_matches_basin_only_deep_in_the_basin() {
+        let (gx, gz) = structural_gradient(5.0, 0.0);
+        assert!((gx - 2.0 * BASIN_COEFF * 5.0).abs() < 1e-4, "gx={gx}");
+        assert!(gz.abs() < 1e-4, "gz={gz}");
+    }
+
+    /// Past `WALL_START`, the structural gradient must equal basin + wall
+    /// with no ridge/cross-hill contribution at all.
+    #[test]
+    fn structural_gradient_adds_the_wall_term_past_wall_start() {
+        let r = 8.0f32;
+        let (gx, gz) = structural_gradient(r, 0.0);
+        let w = (r - WALL_START) / WALL_SPAN;
+        let expected_wall_dr = 3.0 * WALL_COEFF * w * w / WALL_SPAN;
+        let expected = 2.0 * BASIN_COEFF * r + expected_wall_dr;
+        assert!((gx - expected).abs() < 1e-3, "gx={gx} expected={expected}");
+        assert!(gz.abs() < 1e-4, "gz={gz}");
+    }
+
+    /// The whole point of FIX 1: at a point where the decorative ridge/
+    /// cross-hill terms are NOT negligible, the full `gradient` and the
+    /// `structural_gradient` must measurably diverge (proving the latter
+    /// really does exclude them, not just coincide with the former
+    /// everywhere by construction).
+    #[test]
+    fn structural_gradient_diverges_from_full_gradient_where_decoration_is_active() {
+        let (fgx, fgz) = gradient(3.0, 2.0);
+        let (sgx, sgz) = structural_gradient(3.0, 2.0);
+        let dx = fgx - sgx;
+        let dz = fgz - sgz;
+        let diff = fixmath::sqrt(dx * dx + dz * dz);
+        assert!(
+            diff > 0.01,
+            "expected full and structural gradients to diverge here, diff={diff}"
+        );
     }
 }

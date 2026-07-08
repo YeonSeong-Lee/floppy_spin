@@ -316,6 +316,115 @@ fn esc_aborts_a_match_back_to_main_menu() {
     assert!(!d.flow.quit_requested, "match abort must not quit the game");
 }
 
+// ---------------------------------------------------------------------------
+// FIX 6 (M4 verifier, tests-only): Esc-abort coverage for the four Match
+// phases `esc_aborts_a_match_back_to_main_menu` above doesn't reach (it only
+// covers Intro). Each helper below drives one phase further than the last,
+// mirroring that test's own boot->MainMenu->TopSelect->Intro script.
+// ---------------------------------------------------------------------------
+
+/// Boot through TopSelect confirm into a fresh match's Intro (the same
+/// script `esc_aborts_a_match_back_to_main_menu` uses).
+fn enter_match(d: &mut Driver) {
+    d.run_until(InputState::default(), 100, |s| s == Screen::Title, "boot");
+    d.tap(dash()); // -> MainMenu
+    d.tap(dash()); // QUICK BATTLE -> TopSelect
+    d.tap(dash()); // pick -> Match(Intro)
+    d.assert_screen(
+        Screen::Match(MatchPhase::Intro),
+        "match must start at Intro",
+    );
+}
+
+/// From Intro, run out the countdown into Launch (minigame not yet locked).
+fn enter_launch(d: &mut Driver) {
+    enter_match(d);
+    d.run_until(
+        dash(),
+        200,
+        |s| s == Screen::Match(MatchPhase::Launch),
+        "intro countdown",
+    );
+    d.assert_screen(Screen::Match(MatchPhase::Launch), "must reach Launch");
+}
+
+/// From Launch, lock the minigame (Aim -> SpinDir -> Power) into Fight.
+fn enter_fight(d: &mut Driver) {
+    enter_launch(d);
+    d.step(InputState::default()); // release the held dash from the countdown
+    d.tap(dash()); // Aim -> SpinDir
+    d.tap(dash()); // SpinDir -> Power
+    d.tap(dash()); // Power lock -> Fight
+    d.assert_screen(Screen::Match(MatchPhase::Fight), "must reach Fight");
+}
+
+/// From Fight, run the scripted chase-AI fight to a decision.
+fn enter_decided(d: &mut Driver) {
+    enter_fight(d);
+    d.run_until(
+        InputState::default(),
+        200_000,
+        |s| s == Screen::Match(MatchPhase::Decided),
+        "fight to a decision",
+    );
+    d.assert_screen(Screen::Match(MatchPhase::Decided), "must reach Decided");
+}
+
+/// From Decided, wait out the banner hold into RoundResult.
+fn enter_round_result(d: &mut Driver) {
+    enter_decided(d);
+    d.run_until(
+        InputState::default(),
+        200,
+        |s| s == Screen::Match(MatchPhase::RoundResult),
+        "decided banner hold",
+    );
+    d.assert_screen(
+        Screen::Match(MatchPhase::RoundResult),
+        "must reach RoundResult",
+    );
+}
+
+#[test]
+fn esc_aborts_launch_phase_back_to_main_menu() {
+    let mut d = Driver::new(2);
+    enter_launch(&mut d);
+    d.flow.advance(InputState::default(), true);
+    assert_eq!(d.flow.screen, Screen::MainMenu);
+    assert!(d.flow.world.is_none());
+    assert!(!d.flow.quit_requested, "match abort must not quit the game");
+}
+
+#[test]
+fn esc_aborts_fight_phase_back_to_main_menu() {
+    let mut d = Driver::new(3);
+    enter_fight(&mut d);
+    d.flow.advance(InputState::default(), true);
+    assert_eq!(d.flow.screen, Screen::MainMenu);
+    assert!(d.flow.world.is_none());
+    assert!(!d.flow.quit_requested, "match abort must not quit the game");
+}
+
+#[test]
+fn esc_aborts_decided_phase_back_to_main_menu() {
+    let mut d = Driver::new(4);
+    enter_decided(&mut d);
+    d.flow.advance(InputState::default(), true);
+    assert_eq!(d.flow.screen, Screen::MainMenu);
+    assert!(d.flow.world.is_none());
+    assert!(!d.flow.quit_requested, "match abort must not quit the game");
+}
+
+#[test]
+fn esc_aborts_round_result_phase_back_to_main_menu() {
+    let mut d = Driver::new(5);
+    enter_round_result(&mut d);
+    d.flow.advance(InputState::default(), true);
+    assert_eq!(d.flow.screen, Screen::MainMenu);
+    assert!(d.flow.world.is_none());
+    assert!(!d.flow.quit_requested, "match abort must not quit the game");
+}
+
 #[test]
 fn identical_scripts_replay_to_identical_flow_state() {
     // The whole UI is deterministic: two flows fed the same script must
