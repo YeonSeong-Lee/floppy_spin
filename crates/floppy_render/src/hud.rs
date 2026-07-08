@@ -14,7 +14,10 @@ use crate::frame::Frame;
 use crate::text;
 use crate::vfx;
 use floppy_core::fixmath;
-use floppy_core::flow::{GameSettings, MAIN_MENU_ITEMS};
+use floppy_core::flow::{
+    GameSettings, GARAGE_SLOTS, MAIN_MENU_ITEMS, MY_BEY_FLAVOR, MY_BEY_INDEX, MY_BEY_NAME,
+};
+use floppy_core::garage::{self, FRAMES, PART_SLOTS};
 use floppy_core::minigame::{
     self, MinigameState, Stage, GOOD_HI, GOOD_LO, PERFECT_CENTER, PERFECT_HALF_WIDTH,
 };
@@ -454,16 +457,132 @@ pub fn draw_main_menu(frame: &mut Frame, cursor: usize, cursor_anim: f32, ui_fra
     );
 }
 
-pub fn draw_garage_stub(frame: &mut Frame) {
-    draw_text_centered(frame, 160, 3, COL_CURSOR, "GARAGE");
+/// Slot names in `parts` index order (task spec Task 5: "slot list (5)").
+const GARAGE_SLOT_NAMES: [&str; GARAGE_SLOTS] = ["FRAME", "BLADE", "DISK", "RIDGE", "TIP"];
+
+/// The name of the currently-selected part in garage slot `slot` (0 = Frame,
+/// 1..=4 = the stat-delta slots), reading straight from `garage::FRAMES`/
+/// `PART_SLOTS` so the display never drifts from what `resolve()` actually
+/// used. Indices are taken mod each table's own length, mirroring
+/// `garage::resolve`'s own out-of-range handling (never panics).
+fn garage_part_name(slot: usize, idx: u8) -> &'static str {
+    if slot == 0 {
+        FRAMES[idx as usize % FRAMES.len()].name
+    } else {
+        let table = &PART_SLOTS[slot - 1];
+        table[idx as usize % table.len()].name
+    }
+}
+
+/// Bey Garage screen (M8 Task 5, SPEC §7 / game_design.md §3): the 5-slot
+/// part list with the selected slot highlighted in accent, the LIVE
+/// resolved 6-stat readout (recomputed from `parts` every call — never
+/// cached), the build's total flagged if it strays outside the 300±6
+/// budget band, and MY BEY's name/flavor.
+///
+/// ## Preview fidelity (documented decision)
+///
+/// The task brief allows either a full 3D rotating-silhouette preview or a
+/// solid stat panel ("a full 3D preview needs a camera/scene; a rotating
+/// silhouette is nice-to-have, a solid stat panel is the requirement").
+/// This picks the **stat panel** or a colored disc standing in for the
+/// silhouette: a real 3D lathe preview would need `floppy_render::battle`'s
+/// `BattleScene`/camera plumbed into a screen that isn't a `Match` phase at
+/// all (SPEC §7's screen list keeps Garage separate from `Match`), which is
+/// a materially bigger change than this milestone's render-only garage
+/// task. The accent-colored disc + spin-direction arrow chevron gives an
+/// at-a-glance shape/color read of the current Frame without that cost.
+pub fn draw_garage(
+    frame: &mut Frame,
+    parts: [u8; 5],
+    garage_slot: usize,
+    slot_anim: f32,
+    colorblind: bool,
+    ui_frame: u32,
+) {
+    let build = garage::resolve(parts);
+    let accent = vfx::colorblind_remap(build.accent, colorblind);
+
+    draw_text_centered(frame, 30, 3, COL_CURSOR, "BEY GARAGE");
+    draw_text_centered(frame, 66, 2, accent, MY_BEY_NAME);
+
+    // Left column: the 5 slots, each showing its currently-equipped part
+    // name; the selected slot in accent, others dim (mirrors draw_top_select's
+    // list style for a consistent Garage/TopSelect feel).
+    let list_x = 60;
+    let y0 = 130;
+    let row_h = 34;
+    for (i, slot_name) in GARAGE_SLOT_NAMES.iter().enumerate() {
+        let y = y0 + (i as i32) * row_h;
+        let selected = i == garage_slot;
+        let color = if selected { accent } else { COL_DIM };
+        let part_name = garage_part_name(i, parts[i]);
+        text::draw_text(frame, list_x, y, 2, color, slot_name);
+        text::draw_text(frame, list_x + 130, y, 2, color, part_name);
+    }
+    let bob = ((ui_frame / 16) % 2) as i32;
+    let cursor_y = y0 + (slot_anim * row_h as f32) as i32;
+    text::draw_text(frame, list_x - 24 + bob, cursor_y, 2, accent, ">");
+
+    // A plain accent-colored disc stands in for the Frame silhouette
+    // (module docs above): cheap, deterministic, and immediately reflects a
+    // Frame swap's accent + spin-direction chevron.
+    let preview_cx = 470;
+    let preview_cy = 220;
+    draw_ring_outline(frame, preview_cx, preview_cy, 46, 4, accent);
+    draw_ring_outline(frame, preview_cx, preview_cy, 30, 8, dim_color(accent, 0.6));
+    let dir_glyph = if build.spin_dir > 0 { "CW" } else { "CCW" };
+    draw_text_centered(frame, preview_cy + 60, 1, COL_TEXT, dir_glyph);
+
+    // Right panel: the resolved 6 stat bars, LIVE (recomputed from `parts`
+    // above, never a stale snapshot).
+    let stats: [(&str, u8); 6] = [
+        ("ATK", build.stats.atk),
+        ("DEF", build.stats.def),
+        ("STA", build.stats.sta),
+        ("WGT", build.stats.wgt),
+        ("SPD", build.stats.spd),
+        ("MTR", build.stats.mtr),
+    ];
+    let panel_x = 600;
+    let bar_x = panel_x + 60;
+    let bar_max = 220;
+    for (i, (label, v)) in stats.iter().enumerate() {
+        let y = 130 + (i as i32) * 30;
+        text::draw_text(frame, panel_x, y, 2, COL_TEXT, label);
+        let w = (*v as i32 * bar_max) / 100;
+        fill_rect(frame, bar_x, y + 2, bar_max, 10, COL_TRACK);
+        fill_rect(frame, bar_x, y + 2, w, 10, accent);
+        let num = format!("{v:>3}");
+        text::draw_text(frame, bar_x + bar_max + 10, y, 2, COL_TEXT, &num);
+    }
+
+    // Build total, flagged outside the 294..=306 budget band (task spec:
+    // "flag if over 306 / under 294" — game_design.md §3's 300+-6).
+    let total: i32 = build.stats.atk as i32
+        + build.stats.def as i32
+        + build.stats.sta as i32
+        + build.stats.wgt as i32
+        + build.stats.spd as i32
+        + build.stats.mtr as i32;
+    let total_y = 130 + 6 * 30 + 10;
+    let in_band = (294..=306).contains(&total);
+    let total_color = if in_band { COL_TEXT } else { COL_WARN };
+    let total_line = if in_band {
+        format!("TOTAL {total}")
+    } else {
+        format!("TOTAL {total} (OUT OF BUDGET)")
+    };
+    text::draw_text(frame, panel_x, total_y, 2, total_color, &total_line);
+
+    draw_text_centered(frame, 470, 2, accent, MY_BEY_FLAVOR);
     draw_text_centered(
         frame,
-        240,
-        2,
-        COL_TEXT,
-        "PART SWAPPING ARRIVES IN A LATER BUILD",
+        505,
+        1,
+        COL_DIM,
+        "UP/DOWN SLOT - LEFT/RIGHT PART - Z/ESC BACK",
     );
-    draw_text_centered(frame, 500, 1, COL_DIM, "Z/ESC BACK");
 }
 
 pub fn draw_settings(frame: &mut Frame, settings: &GameSettings, cursor: usize, cursor_anim: f32) {
@@ -503,33 +622,76 @@ pub fn draw_settings(frame: &mut Frame, settings: &GameSettings, cursor: usize, 
     draw_text_centered(frame, 500, 1, COL_DIM, "ARROWS ADJUST - Z/ESC BACK");
 }
 
-pub fn draw_top_select(frame: &mut Frame, cursor: usize, cursor_anim: f32, ui_frame: u32) {
+/// SELECT YOUR TOP (SPEC §7). `garage_parts` is the player's live garage
+/// build (M8): the 8th entry, MY BEY at cursor [`MY_BEY_INDEX`], resolves
+/// its stats/accent/spin-dir from these parts every call (`garage::resolve`)
+/// rather than a stale snapshot, so a build changed in the Garage screen
+/// immediately shows correctly here too.
+pub fn draw_top_select(
+    frame: &mut Frame,
+    cursor: usize,
+    cursor_anim: f32,
+    ui_frame: u32,
+    garage_parts: [u8; 5],
+) {
     draw_text_centered(frame, 40, 3, COL_CURSOR, "SELECT YOUR TOP");
 
-    // Left column: the 7 preset names, hovered one in its accent.
+    let my_bey_build = garage::resolve(garage_parts);
+    // A `Preset`-shaped view of the hovered entry: a real roster preset for
+    // 0..PRESETS.len(), or MY BEY (synthesized from the live garage build)
+    // at MY_BEY_INDEX — mirrors `flow::FlowState::preset_view` so render and
+    // sim never disagree about what a given TopSelect index means.
+    let entry_name = |i: usize| -> &'static str {
+        if i == MY_BEY_INDEX {
+            MY_BEY_NAME
+        } else {
+            PRESETS[i].name
+        }
+    };
+    let entry_accent = |i: usize| -> u32 {
+        if i == MY_BEY_INDEX {
+            my_bey_build.accent
+        } else {
+            PRESETS[i].accent
+        }
+    };
+
+    // Left column: the 7 preset names plus MY BEY, hovered one in its accent.
     let list_x = 90;
-    let y0 = 120;
-    let row_h = 40;
-    for (i, p) in PRESETS.iter().enumerate() {
+    let y0 = 110;
+    let row_h = 36;
+    for i in 0..=MY_BEY_INDEX {
         let y = y0 + (i as i32) * row_h;
         let selected = i == cursor;
-        let color = if selected { p.accent } else { COL_DIM };
-        text::draw_text(frame, list_x, y, 2, color, p.name);
+        let color = if selected { entry_accent(i) } else { COL_DIM };
+        text::draw_text(frame, list_x, y, 2, color, entry_name(i));
     }
     let bob = ((ui_frame / 16) % 2) as i32;
     let cursor_y = y0 + (cursor_anim * row_h as f32) as i32;
-    let cursor_accent = PRESETS[cursor.min(PRESETS.len() - 1)].accent;
+    let cursor_accent = entry_accent(cursor.min(MY_BEY_INDEX));
     text::draw_text(frame, list_x - 24 + bob, cursor_y, 2, cursor_accent, ">");
 
-    // Right panel: hovered preset's stats as labeled bars.
-    let p = &PRESETS[cursor.min(PRESETS.len() - 1)];
+    // Right panel: hovered entry's stats as labeled bars (real preset or the
+    // live garage build).
+    let hovered = cursor.min(MY_BEY_INDEX);
+    let (stats_src, accent, spin_dir, flavor) = if hovered == MY_BEY_INDEX {
+        (
+            my_bey_build.stats,
+            my_bey_build.accent,
+            my_bey_build.spin_dir,
+            MY_BEY_FLAVOR,
+        )
+    } else {
+        let p = &PRESETS[hovered];
+        (p.stats, p.accent, p.spin_dir, p.flavor)
+    };
     let stats: [(&str, u8); 6] = [
-        ("ATK", p.stats.atk),
-        ("DEF", p.stats.def),
-        ("STA", p.stats.sta),
-        ("WGT", p.stats.wgt),
-        ("SPD", p.stats.spd),
-        ("MTR", p.stats.mtr),
+        ("ATK", stats_src.atk),
+        ("DEF", stats_src.def),
+        ("STA", stats_src.sta),
+        ("WGT", stats_src.wgt),
+        ("SPD", stats_src.spd),
+        ("MTR", stats_src.mtr),
     ];
     let panel_x = 420;
     let bar_x = panel_x + 60;
@@ -539,19 +701,20 @@ pub fn draw_top_select(frame: &mut Frame, cursor: usize, cursor_anim: f32, ui_fr
         text::draw_text(frame, panel_x, y, 2, COL_TEXT, label);
         let w = (*v as i32 * bar_max) / 100;
         fill_rect(frame, bar_x, y + 2, bar_max, 10, COL_TRACK);
-        fill_rect(frame, bar_x, y + 2, w, 10, p.accent);
+        fill_rect(frame, bar_x, y + 2, w, 10, accent);
         let num = format!("{v:>3}");
         text::draw_text(frame, bar_x + bar_max + 10, y, 2, COL_TEXT, &num);
     }
-    let dir_label = if p.spin_dir > 0 {
+    let dir_label = if spin_dir > 0 {
         "SPIN: CW"
     } else {
         "SPIN: CCW"
     };
     text::draw_text(frame, panel_x, 130 + 6 * 30, 2, COL_TEXT, dir_label);
 
-    // Flavor line (roster.rs, shown on TopSelect per game_design.md §3).
-    draw_text_centered(frame, 460, 2, p.accent, p.flavor);
+    // Flavor line (roster.rs / MY_BEY_FLAVOR, shown on TopSelect per
+    // game_design.md §3).
+    draw_text_centered(frame, 460, 2, accent, flavor);
     draw_text_centered(
         frame,
         505,
@@ -851,12 +1014,18 @@ mod tests {
             ("boot", Box::new(|f| draw_boot(f, 7))),
             ("title", Box::new(|f| draw_title(f, 10))),
             ("menu", Box::new(|f| draw_main_menu(f, 2, 2.0, 30))),
-            ("garage", Box::new(draw_garage_stub)),
+            (
+                "garage",
+                Box::new(|f| draw_garage(f, [1, 2, 3, 0, 1], 2, 2.0, false, 9)),
+            ),
             (
                 "settings",
                 Box::new(move |f| draw_settings(f, &settings, 3, 3.0)),
             ),
-            ("select", Box::new(|f| draw_top_select(f, 4, 4.0, 5))),
+            (
+                "select",
+                Box::new(|f| draw_top_select(f, 4, 4.0, 5, [0, 0, 0, 0, 0])),
+            ),
             ("launch", Box::new(move |f| draw_launch_ui(f, &mg, -1, 12))),
             (
                 "result",
@@ -970,6 +1139,87 @@ mod tests {
         assert!(
             !cb.px.contains(&0x0039_FF14),
             "colorblind mode should never show raw lime"
+        );
+    }
+
+    #[test]
+    fn garage_screen_reflects_live_part_swaps() {
+        let mut before = frame();
+        draw_garage(&mut before, [0, 0, 0, 0, 0], 1, 1.0, false, 0);
+        let mut after = frame();
+        draw_garage(&mut after, [0, 3, 0, 0, 0], 1, 1.0, false, 0);
+        assert_ne!(
+            hash_u32s(&before.px),
+            hash_u32s(&after.px),
+            "swapping Blade to index 3 must visibly change the garage screen"
+        );
+    }
+
+    #[test]
+    fn garage_screen_flags_a_build_outside_the_budget_band() {
+        // Default build (all-zero parts) sits exactly at 300 (in-band);
+        // stacking every slot's most extreme option pushes it out.
+        let mut in_band = frame();
+        draw_garage(&mut in_band, [0, 0, 0, 0, 0], 0, 0.0, false, 0);
+        let mut out_of_band = frame();
+        draw_garage(&mut out_of_band, [0, 3, 3, 3, 3], 0, 0.0, false, 0);
+        assert_ne!(
+            hash_u32s(&in_band.px),
+            hash_u32s(&out_of_band.px),
+            "an out-of-budget build must render differently (flagged) from an in-band one"
+        );
+    }
+
+    #[test]
+    fn garage_screen_is_deterministic_and_colorblind_safe() {
+        let parts = [1, 2, 3, 0, 2];
+        let mut a = frame();
+        draw_garage(&mut a, parts, 3, 3.0, false, 12);
+        let mut b = frame();
+        draw_garage(&mut b, parts, 3, 3.0, false, 12);
+        assert_eq!(
+            hash_u32s(&a.px),
+            hash_u32s(&b.px),
+            "garage draw must be pure"
+        );
+        assert!(painted(&a) > 50, "garage screen painted almost nothing");
+
+        // Colorblind mode must actually change rendering for an
+        // Everspin-framed build (lime accent -> remapped).
+        let lime_parts = [2, 0, 0, 0, 0]; // Frame idx2 = Everspin
+        let mut plain = frame();
+        draw_garage(&mut plain, lime_parts, 0, 0.0, false, 0);
+        let mut cb = frame();
+        draw_garage(&mut cb, lime_parts, 0, 0.0, true, 0);
+        assert_ne!(
+            hash_u32s(&plain.px),
+            hash_u32s(&cb.px),
+            "colorblind mode must remap the garage screen's accent"
+        );
+    }
+
+    #[test]
+    fn top_select_my_bey_entry_shows_the_live_garage_build() {
+        let mut default_parts = frame();
+        draw_top_select(
+            &mut default_parts,
+            MY_BEY_INDEX,
+            MY_BEY_INDEX as f32,
+            0,
+            [0; 5],
+        );
+        let mut swapped_parts = frame();
+        draw_top_select(
+            &mut swapped_parts,
+            MY_BEY_INDEX,
+            MY_BEY_INDEX as f32,
+            0,
+            [3, 3, 3, 3, 3],
+        );
+        assert_ne!(
+            hash_u32s(&default_parts.px),
+            hash_u32s(&swapped_parts.px),
+            "hovering MY BEY must reflect the CURRENT garage parts, not a fixed preset"
         );
     }
 }

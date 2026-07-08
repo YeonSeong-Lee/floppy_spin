@@ -207,10 +207,41 @@ fn every_screen_is_reachable_none_is_a_dead_end_and_a_match_terminates() {
     d.tap(dash());
     d.assert_screen(Screen::MainMenu, "any key on Title must open MainMenu");
 
-    // Garage (cursor 0 -> 1, select, back out with guard/Z).
+    // Garage (cursor 0 -> 1, select, navigate slots + swap a part live,
+    // back out with guard/Z). M8: this now exercises the REAL garage (not
+    // the M4 stub) — slot navigation, live part swapping, and confirming
+    // `garage_build()`/`resolve()` tracks the swap immediately.
     d.tap(dir(0, 1)); // Down arrow intent = dir_y +1
     d.tap(dash());
     d.assert_screen(Screen::Garage, "menu item 1 must be Garage");
+    assert_eq!(d.flow.garage_slot, 0, "garage must open on slot 0 (Frame)");
+    assert_eq!(d.flow.parts, floppy_core::garage::DEFAULT_PARTS);
+
+    // Move to slot 1 (Blade) and cycle its part index with Right/Left.
+    d.tap(dir(0, 1));
+    d.assert_screen(Screen::Garage, "down arrow must stay on Garage");
+    assert_eq!(d.flow.garage_slot, 1, "down arrow must move to slot 1");
+    let part_before = d.flow.parts[1];
+    d.tap(dir(-1, 0)); // Right arrow intent = dir_x -1 (flow.rs convention)
+    assert_ne!(
+        d.flow.parts[1], part_before,
+        "Right on a garage slot must cycle its part index"
+    );
+    let build_after_swap = d.flow.garage_build();
+    assert_eq!(
+        build_after_swap.stats,
+        floppy_core::garage::resolve(d.flow.parts).stats,
+        "the live preview must track garage_build() == resolve(current parts)"
+    );
+    d.tap(dir(1, 0)); // Left arrow intent = dir_x +1: cycle back
+    assert_eq!(
+        d.flow.parts[1], part_before,
+        "Left must cycle the part index back to its starting value"
+    );
+    // Back to slot 0 before leaving (cosmetic, but keeps state tidy).
+    d.tap(dir(0, -1));
+    assert_eq!(d.flow.garage_slot, 0);
+
     d.tap(guard());
     d.assert_screen(Screen::MainMenu, "guard must back out of Garage");
 
@@ -423,6 +454,115 @@ fn esc_aborts_round_result_phase_back_to_main_menu() {
     assert_eq!(d.flow.screen, Screen::MainMenu);
     assert!(d.flow.world.is_none());
     assert!(!d.flow.quit_requested, "match abort must not quit the game");
+}
+
+/// M8: TopSelect's 8th entry (MY BEY, `MY_BEY_INDEX` = `PRESETS.len()`) must
+/// be reachable by cursor navigation, must lock in as `p1_pick`, and must
+/// spawn a fight world whose P1 top carries the LIVE garage build's stats —
+/// through the exact same `LaunchParams`/`World::launch` path a preset
+/// uses, per SPEC §12's "no special-casing" gate. Also confirms the AI
+/// never rolls MY BEY for itself (documented decision in `flow.rs`).
+#[test]
+fn my_bey_is_reachable_from_top_select_and_drives_a_real_fight() {
+    use floppy_core::flow::MY_BEY_INDEX;
+    use floppy_core::garage;
+
+    let mut d = Driver::new(0x0BEE_F00D);
+    d.run_until(InputState::default(), 100, |s| s == Screen::Title, "boot");
+    d.tap(dash()); // -> MainMenu
+    d.tap(dash()); // QUICK BATTLE -> TopSelect
+
+    // Swap one garage part BEFORE picking MY BEY, so its resolved stats
+    // differ from the plain default build — proof the fight world reads the
+    // build at confirm time, not some frozen default.
+    d.flow.parts[1] = 3; // Blade Razor: the extreme ATK/DEF tradeoff
+
+    // Cycle the TopSelect cursor all the way to MY_BEY_INDEX (last entry).
+    for _ in 0..MY_BEY_INDEX {
+        d.tap(dir(0, 1));
+    }
+    assert_eq!(
+        d.flow.select_cursor, MY_BEY_INDEX,
+        "cursor must reach MY BEY"
+    );
+
+    let expected_build = garage::resolve(d.flow.parts);
+    d.tap(dash()); // confirm -> Match(Intro)
+    d.assert_screen(
+        Screen::Match(MatchPhase::Intro),
+        "confirming MY BEY must start the match",
+    );
+    assert_eq!(d.flow.p1_pick, MY_BEY_INDEX, "p1_pick must be MY_BEY_INDEX");
+    assert!(
+        d.flow.ai_pick < MY_BEY_INDEX,
+        "the AI must never roll MY BEY for itself"
+    );
+
+    // Run to Fight and check the world's P1 top carries the garage build's
+    // stats/spin_dir exactly (same LaunchParams path as any preset — no sim
+    // special-casing).
+    d.run_until(
+        dash(),
+        200,
+        |s| s == Screen::Match(MatchPhase::Launch),
+        "intro countdown",
+    );
+    d.step(InputState::default());
+    d.tap(dash()); // Aim -> SpinDir
+    d.tap(dash()); // SpinDir -> Power
+    d.tap(dash()); // Power lock -> Fight
+    d.assert_screen(Screen::Match(MatchPhase::Fight), "must reach Fight");
+
+    let world = d.flow.world.as_ref().expect("Fight must have a world");
+    assert_eq!(world.tops[0].stats, expected_build.stats);
+    assert_eq!(world.tops[0].spin_dir, expected_build.spin_dir);
+}
+
+/// A MY-BEY match hashes identically run-to-run given the same seed/parts/
+/// input script (SPEC §5 determinism, extended to the garage path this
+/// milestone adds). Drives two independent `FlowState`s through an
+/// identical script and compares the whole `World` bit-for-bit at several
+/// points during the fight, not just the final screen.
+#[test]
+fn my_bey_match_is_deterministic_run_to_run() {
+    use floppy_core::flow::MY_BEY_INDEX;
+
+    fn run(seed: u64) -> Vec<floppy_core::physics::Top> {
+        let mut d = Driver::new(seed);
+        d.run_until(InputState::default(), 100, |s| s == Screen::Title, "boot");
+        d.tap(dash());
+        d.tap(dash());
+        d.flow.parts = [2, 1, 3, 0, 2];
+        for _ in 0..MY_BEY_INDEX {
+            d.tap(dir(0, 1));
+        }
+        d.tap(dash()); // confirm MY BEY -> Intro
+        d.run_until(
+            InputState::default(),
+            200,
+            |s| s == Screen::Match(MatchPhase::Launch),
+            "countdown",
+        );
+        d.tap(dash());
+        d.tap(dash());
+        d.tap(dash()); // lock -> Fight
+        for _ in 0..600 {
+            d.step(InputState::default());
+        }
+        d.flow
+            .world
+            .as_ref()
+            .expect("must be in a fight")
+            .tops
+            .to_vec()
+    }
+
+    let a = run(0xD00D_5EED);
+    let b = run(0xD00D_5EED);
+    assert_eq!(
+        a, b,
+        "identical seed+script MY BEY matches must hash identically"
+    );
 }
 
 #[test]

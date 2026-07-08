@@ -41,11 +41,13 @@
 
 use crate::ai;
 use crate::combat::SpecialId;
+use crate::garage::{self, DEFAULT_PARTS};
 use crate::input::InputState;
 use crate::minigame::{ai_roll, Difficulty, LaunchChoice, MinigameState};
 use crate::physics::{BattleEvent, LaunchParams, Outcome, World};
 use crate::rng::{mix_seed, Rng};
-use crate::roster::PRESETS;
+use crate::roster::{Preset, PRESETS};
+use crate::save::SaveState;
 use crate::vec::Vec2;
 use std::f32::consts::{PI, TAU};
 
@@ -78,6 +80,24 @@ const MENU_QUIT: usize = 3;
 
 /// Settings rows, in cursor order (SPEC §7 settings list).
 pub const SETTINGS_ROWS: usize = 6;
+
+/// TopSelect grows one entry (M8): the 7 `PRESETS` plus MY BEY, the
+/// player's garage-built custom top, at cursor index [`MY_BEY_INDEX`].
+pub const TOP_SELECT_ENTRIES: usize = PRESETS.len() + 1;
+/// TopSelect cursor value that means "MY BEY" (garage build) rather than a
+/// `PRESETS` index (task spec: "MY BEY as an 8th pick (index 7 = custom)").
+pub const MY_BEY_INDEX: usize = PRESETS.len();
+
+/// Garage slot count (task spec: "5 slots x 4 parts"; SPEC §9 `[u8; 5]`).
+pub const GARAGE_SLOTS: usize = 5;
+/// Parts-per-slot count (task spec: "4 parts").
+pub const GARAGE_PARTS_PER_SLOT: usize = 4;
+
+/// MY BEY's fixed display name/flavor line (TopSelect/Garage screens) — the
+/// garage build has no `roster::Preset` entry of its own (it's synthesized
+/// from `garage::resolve`), so these live here instead.
+pub const MY_BEY_NAME: &str = "MY BEY";
+pub const MY_BEY_FLAVOR: &str = "Built in the garage. Whatever it is, it's yours.";
 
 /// Salt XORed into the round seed for the AI's launch roll so the roll's RNG
 /// stream is independent of the `World`'s own stream (both derive from the
@@ -254,10 +274,19 @@ pub struct FlowState {
     pub total_frames: u64,
     pub menu_cursor: usize,
     pub settings_cursor: usize,
+    /// TopSelect cursor: `0..PRESETS.len()` picks a roster preset,
+    /// [`MY_BEY_INDEX`] picks the garage-built custom top (M8).
     pub select_cursor: usize,
-    /// Roster indices into [`PRESETS`].
+    /// TopSelect pick locked in at match start: a `PRESETS` index, or
+    /// [`MY_BEY_INDEX`] for MY BEY (M8). AI's own pick (`ai_pick`) is always
+    /// a `PRESETS` index — see `begin_match`'s doc comment for why.
     pub p1_pick: usize,
     pub ai_pick: usize,
+    /// The saved/live garage build: 5 part indices (SPEC §9 `[u8; 5]`,
+    /// `garage::resolve` input). Persisted via `save_snapshot`/`apply_save`.
+    pub parts: [u8; 5],
+    /// Garage screen cursor: which of the 5 slots is selected (`0..5`).
+    pub garage_slot: usize,
     /// Match score `[P1, AI]` (SPEC §6.5: first to 4).
     pub score: [u8; 2],
     /// 0-based round index; the round seed is `mix_seed(match_seed, round)`.
@@ -430,6 +459,18 @@ fn adjust_volume(v: u8, delta: i32) -> u8 {
     (v as i32 + delta).clamp(0, 10) as u8
 }
 
+/// Number of selectable parts for garage slot `slot` (0 = Frame, 1..=4 =
+/// the stat-delta slots) — reads `garage::FRAMES`/`PART_SLOTS`'s actual
+/// lengths rather than hardcoding 4 everywhere `advance`'s Garage arm needs
+/// a wrap width.
+fn garage_slot_width(slot: usize) -> usize {
+    if slot == 0 {
+        garage::FRAMES.len()
+    } else {
+        garage::PART_SLOTS[slot - 1].len()
+    }
+}
+
 fn adjust_setting(s: &mut GameSettings, row: usize, delta: i32) {
     match row {
         0 => s.music_vol = adjust_volume(s.music_vol, delta),
@@ -455,6 +496,8 @@ impl FlowState {
             select_cursor: 0,
             p1_pick: 0,
             ai_pick: 0,
+            parts: DEFAULT_PARTS,
+            garage_slot: 0,
             score: [0, 0],
             round: 0,
             match_seed: 0,
@@ -481,13 +524,47 @@ impl FlowState {
         mix_seed(self.match_seed, self.round)
     }
 
+    /// Resolve the CURRENT garage build (module docs: recomputed live so the
+    /// Garage screen's preview always reflects `parts` immediately).
+    pub fn garage_build(&self) -> garage::CustomBuild {
+        garage::resolve(self.parts)
+    }
+
+    /// A `Preset`-shaped view of whatever TopSelect index `pick` refers to:
+    /// a real roster entry for `0..PRESETS.len()`, or MY BEY (synthesized
+    /// from the live garage build) for [`MY_BEY_INDEX`]. This is the ONLY
+    /// place the custom top's identity is materialized; every downstream
+    /// consumer (`preview_world`, `spawn_fight_world`, rendering) reads a
+    /// plain `Preset` either way, so the sim/render code never special-cases
+    /// "is this a preset or a custom top" — it just sees a `Preset`
+    /// (task spec / SPEC §12 gate: no special-casing).
+    ///
+    /// Out-of-range `pick` values (defensive only — `select_cursor`/
+    /// `p1_pick`/`ai_pick` are always kept in `0..=MY_BEY_INDEX` by
+    /// `advance`/`begin_match`) fall back to preset 0.
+    pub fn preset_view(&self, pick: usize) -> Preset {
+        if pick == MY_BEY_INDEX {
+            let build = self.garage_build();
+            Preset {
+                name: MY_BEY_NAME,
+                flavor: MY_BEY_FLAVOR,
+                stats: build.stats,
+                spin_dir: build.spin_dir,
+                accent: build.accent,
+                silhouette: build.silhouette,
+            }
+        } else {
+            PRESETS[pick.min(PRESETS.len() - 1)]
+        }
+    }
+
     /// Cosmetic never-stepped preview world for Intro/Launch rendering: P1's
     /// top on the launch circle at the minigame's live heading/depth, the AI
     /// opposite. Power/quality are fixed placeholders — this world never
     /// becomes the fight sim (the real one is spawned fresh on power lock).
     fn preview_world(&self) -> World {
-        let p1_preset = &PRESETS[self.p1_pick];
-        let ai_preset = &PRESETS[self.ai_pick];
+        let p1_preset = self.preset_view(self.p1_pick);
+        let ai_preset = self.preset_view(self.ai_pick);
         let params = [
             LaunchParams {
                 heading: self.minigame.heading,
@@ -520,6 +597,13 @@ impl FlowState {
     /// TopSelect confirm: lock picks, derive the match seed, roll the AI's
     /// roster pick, zero the score. (Screen transitions happen only at the
     /// call sites inside `advance`'s match — helpers never change `screen`.)
+    ///
+    /// The AI always picks a real `PRESETS` entry, never MY BEY (documented
+    /// decision: the garage build is the player's own creation, and letting
+    /// the AI roll it too would need a second, independently-tuned "AI
+    /// plays a custom top" balance pass that's out of scope here — simplest
+    /// or the AI just plays the roster, which the balance tests already
+    /// cover).
     fn begin_match(&mut self) {
         self.p1_pick = self.select_cursor;
         self.match_seed = mix_seed(self.base_seed, self.total_frames as u32);
@@ -537,7 +621,7 @@ impl FlowState {
     /// Per-round reset: fresh minigame (defaulted to the pick's preset spin
     /// direction) + preview world for the Intro/Launch backdrop.
     fn begin_round(&mut self) {
-        self.minigame = MinigameState::new(PRESETS[self.p1_pick].spin_dir);
+        self.minigame = MinigameState::new(self.preset_view(self.p1_pick).spin_dir);
         self.ai_choice = None;
         self.refresh_preview();
     }
@@ -558,11 +642,18 @@ impl FlowState {
     /// Power lock: spawn the real fight world from both launch choices
     /// (P1's minigame result + the AI's pre-rolled quality), applying the
     /// PERFECT bonus meter and Overcharge starting tilt to the spawned tops.
+    /// P1's `LaunchParams` come from `preset_view(p1_pick)` — when
+    /// `p1_pick == MY_BEY_INDEX` that's the garage build's resolved
+    /// `Stats`/`spin_dir`/`special_id`, fed through the EXACT same
+    /// `LaunchParams` -> `World::launch` -> `spawn_launch_top` path a preset
+    /// uses (SPEC §12 gate: the sim never special-cases a custom top).
     fn spawn_fight_world(&mut self, choice: LaunchChoice) {
+        let p1_preset = self.preset_view(self.p1_pick);
+        let ai_preset = self.preset_view(self.ai_pick);
         let ai_choice = self.ai_choice.unwrap_or(LaunchChoice {
             heading: 0.0,
             depth: 0.7,
-            spin_dir: PRESETS[self.ai_pick].spin_dir,
+            spin_dir: ai_preset.spin_dir,
             power_frac: 0.5,
             quality: 1.0,
             bonus_meter: 0.0,
@@ -575,8 +666,8 @@ impl FlowState {
                 power: choice.power_frac,
                 quality: choice.quality,
                 spin_dir: choice.spin_dir,
-                stats: PRESETS[self.p1_pick].stats,
-                special_id: SpecialId::from_silhouette(PRESETS[self.p1_pick].silhouette),
+                stats: p1_preset.stats,
+                special_id: SpecialId::from_silhouette(p1_preset.silhouette),
             },
             LaunchParams {
                 heading: wrap_tau(choice.heading + PI),
@@ -584,8 +675,8 @@ impl FlowState {
                 power: ai_choice.power_frac,
                 quality: ai_choice.quality,
                 spin_dir: ai_choice.spin_dir,
-                stats: PRESETS[self.ai_pick].stats,
-                special_id: SpecialId::from_silhouette(PRESETS[self.ai_pick].silhouette),
+                stats: ai_preset.stats,
+                special_id: SpecialId::from_silhouette(ai_preset.silhouette),
             },
         ];
         let mut world = World::launch(self.round_seed(), params);
@@ -658,9 +749,11 @@ impl FlowState {
                 }
             }
 
-            // TopSelect ▶ Match(Intro) on pick | back to MainMenu.
+            // TopSelect ▶ Match(Intro) on pick | back to MainMenu. `n`
+            // includes MY BEY as an 8th entry (M8: TOP_SELECT_ENTRIES =
+            // PRESETS.len() + 1, cursor index MY_BEY_INDEX).
             Screen::TopSelect => {
-                let n = PRESETS.len();
+                let n = TOP_SELECT_ENTRIES;
                 if e.up || e.left {
                     self.select_cursor = (self.select_cursor + n - 1) % n;
                 }
@@ -675,8 +768,29 @@ impl FlowState {
                 }
             }
 
-            // Garage (stub, SPEC §7) ▶ MainMenu.
+            // Garage ▶ MainMenu (M8: real part-swapping, SPEC §7). `garage_slot`
+            // (up/down) selects which of the 5 slots is active; left/right
+            // cycles that slot's part index within its own option count
+            // (4 for every slot — `garage::FRAMES`/`PART_SLOTS` are all
+            // 4-wide, but this reads each slot's own length rather than
+            // hardcoding 4, so a future slot with a different width Just
+            // Works). `garage::resolve` is recomputed live by
+            // `FlowState::garage_build` — nothing here caches a stale build.
             Screen::Garage => {
+                if e.up {
+                    self.garage_slot = (self.garage_slot + GARAGE_SLOTS - 1) % GARAGE_SLOTS;
+                }
+                if e.down {
+                    self.garage_slot = (self.garage_slot + 1) % GARAGE_SLOTS;
+                }
+                if e.left || e.right {
+                    let slot = self.garage_slot;
+                    let width = garage_slot_width(slot);
+                    let delta: i32 = if e.right { 1 } else { -1 };
+                    let cur = self.parts[slot] as i32;
+                    self.parts[slot] =
+                        (((cur + delta) % width as i32 + width as i32) % width as i32) as u8;
+                }
                 if e.esc || e.back {
                     next = Some(Screen::MainMenu);
                 }
@@ -834,6 +948,25 @@ impl FlowState {
         self.total_frames = self.total_frames.wrapping_add(1);
         self.prev_input = input;
         self.prev_esc = esc;
+    }
+
+    /// Apply a decoded save (Task M8-6, called once on boot before the main
+    /// loop starts): overwrites the live garage `parts` and `settings` with
+    /// the save's values. `save::decode` already guarantees `s` is either a
+    /// fully-valid save or `SaveState::default()` — this method never needs
+    /// to validate anything itself, it just applies both fields together
+    /// (SPEC §9 "never partially apply" is `decode`'s job, not this one's).
+    pub fn apply_save(&mut self, s: SaveState) {
+        self.parts = s.parts;
+        self.settings = s.settings;
+    }
+
+    /// The persistable slice of flow state: current garage `parts` plus
+    /// `settings`, ready for `save::encode`. See `main.rs` for the exact
+    /// persist-trigger points (Task M8-6 docs there: Garage-exit,
+    /// Settings-exit, and quit).
+    pub fn save_snapshot(&self) -> ([u8; 5], GameSettings) {
+        (self.parts, self.settings)
     }
 }
 

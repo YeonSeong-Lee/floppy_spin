@@ -250,6 +250,9 @@ extern "system" {
     fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> BOOL;
     fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> BOOL;
     fn Sleep(dwMilliseconds: DWORD);
+    // ---- Save I/O (Task M8-3; SPEC §9) ----
+    fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: *mut u16, nSize: DWORD) -> DWORD;
+    fn CreateDirectoryW(lpPathName: LPCWSTR, lpSecurityAttributes: LPVOID) -> BOOL;
 }
 
 #[link(name = "winmm")]
@@ -718,4 +721,84 @@ impl Drop for Platform {
             DestroyWindow(self.hwnd);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Save I/O (Task M8-3; SPEC §9): `%APPDATA%\floppy_spin\save.bin`. The only
+// unsafe here is fetching the `%APPDATA%` path (`GetEnvironmentVariableW`,
+// since that's not a std-portable env read the rest of the codebase uses)
+// and creating the `floppy_spin` subdirectory (`CreateDirectoryW`); the
+// actual file read/write goes through `std::fs`, which is plain safe Rust
+// and is allowed in this root-level unsafe-only file per the task brief
+// ("std::fs is allowed here in the root bin ... simplest: GetEnvironmentVariableW
+// for the path, then std::fs::write"). Both directions are best-effort: any
+// failure (missing var, missing file, a locked/unwritable directory, ...)
+// degrades to "no save" rather than ever panicking or crashing the game
+// (SPEC §9: "never crash").
+// ---------------------------------------------------------------------------
+
+/// `%APPDATA%` env var name (SPEC §9: "path via GetEnvironmentVariableW").
+const APPDATA_VAR: &str = "APPDATA";
+/// Save file location under `%APPDATA%` (SPEC §9, exact).
+const SAVE_SUBPATH: &str = "floppy_spin\\save.bin";
+const SAVE_DIR_SUBPATH: &str = "floppy_spin";
+
+/// Read `%APPDATA%` via `GetEnvironmentVariableW`. Returns `None` if the
+/// variable is unset or the call otherwise fails (buffer-too-small is
+/// handled by growing once to the size the API reports it needs).
+fn appdata_dir() -> Option<String> {
+    let name = to_wstring(APPDATA_VAR);
+    let mut buf: Vec<u16> = vec![0; 512];
+    let len =
+        unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD) };
+    if len == 0 {
+        return None; // unset, or a genuine failure — both mean "no save".
+    }
+    if len as usize > buf.len() {
+        // The initial 512-u16 buffer was too small; `len` is the required
+        // size (including the nul terminator) — retry once at that size.
+        buf = vec![0; len as usize];
+        let len2 =
+            unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD) };
+        if len2 == 0 || len2 as usize > buf.len() {
+            return None;
+        }
+        buf.truncate(len2 as usize);
+    } else {
+        buf.truncate(len as usize);
+    }
+    String::from_utf16(&buf).ok()
+}
+
+/// Read the whole save file. Returns an empty `Vec` on ANY failure (no
+/// `%APPDATA%`, no directory, no file, a read error, ...) — `save::decode`
+/// turns an empty (or any otherwise-invalid) blob into `SaveState::default()`,
+/// so this never needs to distinguish "missing" from "corrupt" itself.
+pub fn save_load() -> Vec<u8> {
+    let Some(appdata) = appdata_dir() else {
+        return Vec::new();
+    };
+    let path = std::path::Path::new(&appdata).join(SAVE_SUBPATH);
+    std::fs::read(path).unwrap_or_default()
+}
+
+/// Best-effort save write: create `%APPDATA%\floppy_spin` if missing (via
+/// `CreateDirectoryW`; "already exists" is not an error — ignored the same
+/// as any other failure here), then `std::fs::write` the bytes. Never
+/// panics, never propagates an error — a failed save is silently dropped
+/// (task brief: "never crash the game over a save").
+pub fn save_store(bytes: &[u8]) {
+    let Some(appdata) = appdata_dir() else {
+        return;
+    };
+    let dir = std::path::Path::new(&appdata).join(SAVE_DIR_SUBPATH);
+    let dir_w = to_wstring(&dir.to_string_lossy());
+    unsafe {
+        // Return value ignored on purpose: 0 covers both "already exists"
+        // (ERROR_ALREADY_EXISTS) and any other failure; either way the
+        // subsequent write attempt is the real success/failure signal.
+        CreateDirectoryW(dir_w.as_ptr(), ptr::null_mut());
+    }
+    let path = dir.join("save.bin");
+    let _ = std::fs::write(path, bytes);
 }

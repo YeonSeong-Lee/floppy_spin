@@ -12,14 +12,15 @@ use floppy_core::flow::{self, FlowState, MatchPhase, Screen, MATCH_WIN_POINTS};
 use floppy_core::input::InputState;
 use floppy_core::physics::{self, BattleEvent, TUNE};
 use floppy_core::rng::Rng;
-use floppy_core::roster::{Preset, PRESETS};
+use floppy_core::roster::Preset;
+use floppy_core::save;
 use floppy_core::vec::Vec2;
 use floppy_render::battle::{accent_to_vec3, BattleScene};
 use floppy_render::frame::Frame;
 use floppy_render::particles::{self, ParticlePool};
 use floppy_render::post::PostState;
 use floppy_render::{hud, vfx};
-use platform::win32::{Platform, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
+use platform::win32::{self, Platform, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
 const H: usize = 540;
@@ -104,6 +105,9 @@ struct Vfx {
     menu_spring: vfx::Spring,
     select_spring: vfx::Spring,
     settings_spring: vfx::Spring,
+    /// Garage slot cursor spring (M8), same "~120 ms spring settle" treatment
+    /// as the other menu cursors.
+    garage_spring: vfx::Spring,
     intro_scale: vfx::OvershootSpring,
     decided_scale: vfx::OvershootSpring,
     matchover_scale: vfx::OvershootSpring,
@@ -127,6 +131,7 @@ impl Vfx {
             menu_spring: vfx::Spring::new(0.0),
             select_spring: vfx::Spring::new(0.0),
             settings_spring: vfx::Spring::new(0.0),
+            garage_spring: vfx::Spring::new(0.0),
             intro_scale: vfx::OvershootSpring::default(),
             decided_scale: vfx::OvershootSpring::default(),
             matchover_scale: vfx::OvershootSpring::default(),
@@ -156,7 +161,7 @@ fn handle_battle_event(
     v: &mut Vfx,
     world: &physics::World,
     ev: &BattleEvent,
-    presets: [&Preset; 2],
+    presets: [Preset; 2],
 ) {
     match *ev {
         BattleEvent::Hit { heavy, pos, .. } => {
@@ -294,7 +299,13 @@ fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
         v.particles = ParticlePool::new();
     }
 
-    let presets = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
+    // M8: `preset_view` resolves MY BEY (p1_pick == MY_BEY_INDEX) from the
+    // live garage build instead of indexing `PRESETS` directly, so this
+    // never panics once TopSelect's 8th entry is pickable.
+    let presets = [
+        flow_state.preset_view(flow_state.p1_pick),
+        flow_state.preset_view(flow_state.ai_pick),
+    ];
 
     if let Some(world) = &flow_state.world {
         for ev in &flow_state.frame_events {
@@ -384,6 +395,7 @@ fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
     v.select_spring.ease_toward(flow_state.select_cursor as f32);
     v.settings_spring
         .ease_toward(flow_state.settings_cursor as f32);
+    v.garage_spring.ease_toward(flow_state.garage_slot as f32);
 
     v.particles.update();
     v.shake.step();
@@ -430,7 +442,14 @@ fn render(
         }
         Screen::Garage => {
             frame.clear(hud::COL_BG);
-            hud::draw_garage_stub(frame);
+            hud::draw_garage(
+                frame,
+                flow_state.parts,
+                flow_state.garage_slot,
+                vfxs.garage_spring.value,
+                colorblind,
+                flow_state.frame,
+            );
         }
         Screen::Settings => {
             frame.clear(hud::COL_BG);
@@ -448,10 +467,16 @@ fn render(
                 flow_state.select_cursor,
                 vfxs.select_spring.value,
                 flow_state.frame,
+                flow_state.parts,
             );
         }
         Screen::Match(phase) => {
-            let visuals = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
+            // M8: owned locals (not `&PRESETS[..]`) since `p1_pick` may be
+            // `MY_BEY_INDEX` — `preset_view` resolves that from the live
+            // garage build rather than indexing the roster array.
+            let p1_visual = flow_state.preset_view(flow_state.p1_pick);
+            let ai_visual = flow_state.preset_view(flow_state.ai_pick);
+            let visuals = [&p1_visual, &ai_visual];
             let accents = [visuals[0].accent, visuals[1].accent];
 
             // 3D backdrop: the live sim during Fight/Decided, the cosmetic
@@ -557,7 +582,9 @@ fn render(
             }
         }
         Screen::MatchOver => {
-            let visuals = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
+            let p1_visual = flow_state.preset_view(flow_state.p1_pick);
+            let ai_visual = flow_state.preset_view(flow_state.ai_pick);
+            let visuals = [&p1_visual, &ai_visual];
             match (&flow_state.world_prev, &flow_state.world) {
                 (Some(prev), Some(curr)) => scene.draw_ex(
                     frame,
@@ -685,6 +712,14 @@ fn main() {
     // run-to-run while everything inside core stays wall-clock-free.
     let mut flow_state = FlowState::new(0xF10B_B75E);
 
+    // ---- M8 Task 6: load-on-boot (SPEC §9). `platform::save_load` returns
+    // an empty Vec on ANY failure (no %APPDATA%, no file, ...) and
+    // `save::decode` turns anything that isn't a fully-valid blob
+    // (including empty) into `SaveState::default()` — so this line alone
+    // covers "no save file yet" and "corrupt save file" identically, with
+    // no branching needed here.
+    flow_state.apply_save(save::decode(&win32::save_load()));
+
     // Fixed-timestep pump (SPEC §5): the SimClock banks wall time into whole
     // 120 Hz steps; every SIM_STEPS_PER_FLOW_FRAME (2) banked steps run one
     // flow frame (which itself steps the World/minigame twice during
@@ -723,6 +758,22 @@ fn main() {
 
             flow_state.advance(input, esc);
             pending_steps -= flow::SIM_STEPS_PER_FLOW_FRAME;
+
+            // ---- M8 Task 6: persist on leaving Garage or Settings (SPEC
+            // §9). Screen-transition edge, not every frame: `prev_nav.screen`
+            // (captured above, before this `advance`) was Garage/Settings and
+            // the new screen isn't, i.e. the player just backed out — that's
+            // the natural "commit this build/these settings" moment for
+            // both screens (Garage: Z/Esc backs to MainMenu after part
+            // swaps; Settings: same, after adjustments). Writing on every
+            // frame would mean a write per keystroke while adjusting a
+            // slider, which is unnecessary I/O for a file this small.
+            if prev_nav.screen != flow_state.screen
+                && matches!(prev_nav.screen, Screen::Garage | Screen::Settings)
+            {
+                let (parts, settings) = flow_state.save_snapshot();
+                win32::save_store(&save::encode(parts, &settings));
+            }
 
             // ---- Music: replace the Tracker wholesale on a song switch.
             let desired_song = song_for_screen(flow_state.screen);
@@ -781,6 +832,12 @@ fn main() {
         // Esc semantics (quit on Title/MainMenu, back/abort elsewhere) are
         // decided entirely inside flow::advance.
         if flow_state.quit_requested {
+            // ---- M8 Task 6: persist on quit (SPEC §9), so settings/garage
+            // changes made since the last Garage/Settings-exit (e.g. the
+            // player tweaked Settings then immediately quit from MainMenu
+            // without a further screen transition) are never silently lost.
+            let (parts, settings) = flow_state.save_snapshot();
+            win32::save_store(&save::encode(parts, &settings));
             break;
         }
 
