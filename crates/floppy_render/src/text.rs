@@ -132,6 +132,49 @@ pub fn measure(s: &str, scale: usize) -> (usize, usize) {
     (s.chars().count() * ADVANCE * scale, GLYPH_H * scale)
 }
 
+/// Fractional-scale sibling of [`draw_text`] (M7 round choreography:
+/// countdown numeral pop / outcome banner overshoot-settle, both of which
+/// animate a CONTINUOUS scale factor, not the whole-number steps the bitmap
+/// font's integer `scale` was built for). Each glyph pixel is expanded to a
+/// `ceil(scale) x ceil(scale)` block positioned at a float coordinate
+/// (truncated to the pixel grid) — not true sub-pixel anti-aliasing, but
+/// smooth enough frame-to-frame that a 1.3x -> 1.0x or 1.5x -> 1.0x settle
+/// reads as continuous motion rather than discrete integer-scale steps.
+pub fn draw_text_scaled(frame: &mut Frame, x: f32, y: f32, scale: f32, color: u32, s: &str) {
+    if scale <= 0.0 {
+        return;
+    }
+    let block = (scale.max(1.0)) as i32;
+    let mut cursor_x = x;
+    for ch in s.chars() {
+        let glyph = &FONT[glyph_index(ch)];
+        for (row, &bits) in glyph.iter().enumerate() {
+            for col in 0..GLYPH_W {
+                let bit = (bits >> (GLYPH_W - 1 - col)) & 1;
+                if bit == 1 {
+                    let px0 = (cursor_x + col as f32 * scale) as i32;
+                    let py0 = (y + row as f32 * scale) as i32;
+                    for sy in 0..block {
+                        for sx in 0..block {
+                            frame.set(px0 + sx, py0 + sy, color);
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += ADVANCE as f32 * scale;
+    }
+}
+
+/// `(width, height)` in pixels that [`draw_text_scaled`] would occupy for `s`
+/// at `scale`.
+pub fn measure_scaled(s: &str, scale: f32) -> (f32, f32) {
+    (
+        s.chars().count() as f32 * ADVANCE as f32 * scale,
+        GLYPH_H as f32 * scale,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +185,29 @@ mod tests {
         draw_text(&mut f, 2, 2, 2, 0x00FFFFFF, "SPIN 42");
         let painted = f.px.iter().filter(|&&p| p != 0).count();
         assert!(painted > 0, "expected some painted pixels");
+    }
+
+    #[test]
+    fn draw_text_scaled_paints_more_at_bigger_scale_and_is_deterministic() {
+        let mut small = Frame::new(200, 60);
+        draw_text_scaled(&mut small, 2.0, 2.0, 1.5, 0x00FFFFFF, "GO!");
+        let small_count = small.px.iter().filter(|&&p| p != 0).count();
+
+        let mut big = Frame::new(200, 60);
+        draw_text_scaled(&mut big, 2.0, 2.0, 3.0, 0x00FFFFFF, "GO!");
+        let big_count = big.px.iter().filter(|&&p| p != 0).count();
+        assert!(big_count > small_count);
+
+        let mut big2 = Frame::new(200, 60);
+        draw_text_scaled(&mut big2, 2.0, 2.0, 3.0, 0x00FFFFFF, "GO!");
+        assert_eq!(big.px, big2.px);
+    }
+
+    #[test]
+    fn draw_text_scaled_zero_or_negative_scale_never_panics() {
+        let mut f = Frame::new(10, 10);
+        draw_text_scaled(&mut f, 0.0, 0.0, 0.0, 0xFFFFFF, "X");
+        draw_text_scaled(&mut f, 0.0, 0.0, -2.0, 0xFFFFFF, "X");
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! interpolating it with the same weights is exact, not an approximation.
 
 use crate::frame::Frame;
+use crate::post::BrightBuffer;
 
 /// Gouraud-shaded, already-projected vertex: `(x, y)` in screen pixels,
 /// `inv_z` = `1/view_z` (see `frame.rs`/`camera.rs`), `r`/`g`/`b` in `0..1`.
@@ -244,7 +245,10 @@ fn pack(r: f32, g: f32, b: f32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-fn add_saturating(dst: u32, src: u32) -> u32 {
+/// Saturating per-channel add of two packed `0x00RRGGBB` colors. `pub(crate)`
+/// so `post.rs`/`particles.rs` (M7 bloom/VFX) share the exact same packing
+/// convention instead of re-deriving it.
+pub(crate) fn add_saturating(dst: u32, src: u32) -> u32 {
     let dr = (dst >> 16) & 0xFF;
     let dg = (dst >> 8) & 0xFF;
     let db = dst & 0xFF;
@@ -255,6 +259,105 @@ fn add_saturating(dst: u32, src: u32) -> u32 {
     let g = (dg + sg).min(255);
     let b = (db + sb).min(255);
     (r << 16) | (g << 8) | b
+}
+
+// ---------------------------------------------------------------------------
+// M7 bloom-tagged variants (game_design.md §6 bloom recipe): identical
+// coverage/fill-rule/depth-test math to `draw_tri`/`draw_tri_additive` above
+// (this file's ONE rasterization loop, not a fork of it — see
+// `draw_tri_bloom`'s/`draw_tri_additive_bloom`'s bodies, which share `setup`
+// and differ from their non-bloom siblings only by the bright-buffer stamp),
+// plus one cheap per-pixel branch: when `emissive` is `true` (decided ONCE
+// per triangle by the caller — `scene.rs`'s bloom-aware instance draw, based
+// on whether the triangle's material has a nonzero emissive term), every
+// full-res pixel actually painted ALSO stamps its shaded color into the
+// half-res `BrightBuffer` at the corresponding half-res cell
+// (`x/2, y/2` — plain integer halving, i.e. nearest/block-replicate
+// sampling, not bilinear; see `post.rs` module docs for the upsample side of
+// that same choice). Non-emissive triangles (`emissive == false`) skip the
+// bright-buffer branch entirely, so the inner loop cost for the vast
+// majority of (dark metal) pixels is exactly one extra `bool` compare.
+#[allow(clippy::too_many_arguments)]
+fn draw_tri_ex(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    a: SVert,
+    b: SVert,
+    c: SVert,
+    additive: bool,
+    emissive: bool,
+) {
+    let Some((x0, y0, x1, y1, s)) = setup(frame, a, b, c) else {
+        return;
+    };
+
+    let mut w0_row = s.w0_row;
+    let mut w1_row = s.w1_row;
+    let mut w2_row = s.w2_row;
+
+    for y in y0..y1 {
+        let mut w0 = w0_row;
+        let mut w1 = w1_row;
+        let mut w2 = w2_row;
+        for x in x0..x1 {
+            let in0 = if s.incl0 { w0 >= 0.0 } else { w0 > 0.0 };
+            let in1 = if s.incl1 { w1 >= 0.0 } else { w1 > 0.0 };
+            let in2 = if s.incl2 { w2 >= 0.0 } else { w2 > 0.0 };
+            if in0 && in1 && in2 {
+                let l0 = w0 * s.inv_area;
+                let l1 = w1 * s.inv_area;
+                let l2 = w2 * s.inv_area;
+                let idx = y * frame.w + x;
+                let inv_z = l0 * a.inv_z + l1 * b.inv_z + l2 * c.inv_z;
+                if inv_z > frame.depth[idx] {
+                    let r = l0 * a.r + l1 * b.r + l2 * c.r;
+                    let g = l0 * a.g + l1 * b.g + l2 * c.g;
+                    let bl = l0 * a.b + l1 * b.b + l2 * c.b;
+                    let color = pack(r, g, bl);
+                    if additive {
+                        frame.px[idx] = add_saturating(frame.px[idx], color);
+                    } else {
+                        frame.px[idx] = color;
+                        frame.depth[idx] = inv_z;
+                    }
+                    if emissive && x & 1 == 0 && y & 1 == 0 {
+                        bright.add((x / 2) as i32, (y / 2) as i32, color);
+                    }
+                }
+            }
+            w0 += s.dx0;
+            w1 += s.dx1;
+            w2 += s.dx2;
+        }
+        w0_row += s.dy0;
+        w1_row += s.dy1;
+        w2_row += s.dy2;
+    }
+}
+
+/// Bloom-tagged, depth-writing opaque triangle (see [`draw_tri`]).
+pub fn draw_tri_bloom(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    a: SVert,
+    b: SVert,
+    c: SVert,
+    emissive: bool,
+) {
+    draw_tri_ex(frame, bright, a, b, c, false, emissive);
+}
+
+/// Bloom-tagged, depth-tested-but-not-written additive triangle (see
+/// [`draw_tri_additive`]).
+pub fn draw_tri_additive_bloom(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    a: SVert,
+    b: SVert,
+    c: SVert,
+    emissive: bool,
+) {
+    draw_tri_ex(frame, bright, a, b, c, true, emissive);
 }
 
 #[cfg(test)]

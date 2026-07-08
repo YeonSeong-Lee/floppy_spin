@@ -12,6 +12,7 @@
 
 use crate::frame::Frame;
 use crate::text;
+use crate::vfx;
 use floppy_core::fixmath;
 use floppy_core::flow::{GameSettings, MAIN_MENU_ITEMS};
 use floppy_core::minigame::{
@@ -90,15 +91,27 @@ fn draw_text_centered(frame: &mut Frame, y: i32, scale: usize, color: u32, s: &s
 // ---------------------------------------------------------------------------
 
 /// Centered large banner text with a drop shadow, vertically centered a
-/// little above the frame middle so it doesn't cover the tops.
+/// little above the frame middle so it doesn't cover the tops. `scale` is
+/// the INTEGER base size (matches every existing call site); see
+/// [`draw_banner_scaled`] for the M7 overshoot-settle animated version.
 pub fn draw_banner(frame: &mut Frame, banner: &str, scale: usize, color: u32) {
-    let (_, h) = text::measure(banner, scale);
-    let y = (frame.h as i32 - h as i32) / 2 - 40;
-    let (w, _) = text::measure(banner, scale);
-    let x = (frame.w as i32 - w as i32) / 2;
-    let off = (scale as i32 / 2).max(1);
-    text::draw_text(frame, x + off, y + off, scale, COL_SHADOW, banner);
-    text::draw_text(frame, x, y, scale, color, banner);
+    draw_banner_scaled(frame, banner, scale as f32, color);
+}
+
+/// M7 round choreography (game_design.md §7): same centered-banner layout as
+/// [`draw_banner`], but `scale` is a continuous `f32` so a caller-driven
+/// overshoot-settle spring (see `vfx::OvershootSpring`) can pop the banner in
+/// at e.g. 1.5x and animate it down to 1.0x over several frames. The
+/// centering math re-measures at the CURRENT scale every call (so the text
+/// stays centered while it's still shrinking, not just once at its final
+/// size).
+pub fn draw_banner_scaled(frame: &mut Frame, banner: &str, scale: f32, color: u32) {
+    let (w, h) = text::measure_scaled(banner, scale);
+    let y = (frame.h as f32 - h) / 2.0 - 40.0;
+    let x = (frame.w as f32 - w) / 2.0;
+    let off = (scale * 0.5).max(1.0);
+    text::draw_text_scaled(frame, x + off, y + off, scale, COL_SHADOW, banner);
+    text::draw_text_scaled(frame, x, y, scale, color, banner);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +138,11 @@ pub struct PlayerPanel<'a> {
 }
 
 /// 270-degree stamina arc: `frac` full (`0..=1`) in `color`, remainder in
-/// the dark track color.
-pub fn draw_stamina_arc(frame: &mut Frame, cx: i32, cy: i32, frac: f32, color: u32) {
+/// the dark track color. `stripe` (game_design.md §7 colorblind mode: "stripe
+/// pattern on the P2 stamina arc — hue never the sole signal") overlays dark
+/// bands every few degrees across the FILLED portion so it reads distinctly
+/// even if `color` is indistinguishable from P1's.
+pub fn draw_stamina_arc(frame: &mut Frame, cx: i32, cy: i32, frac: f32, color: u32, stripe: bool) {
     let frac = frac.clamp(0.0, 1.0);
     let span = 2.0 * ARC_HALF_SPAN;
     for dy in -ARC_R_OUTER..=ARC_R_OUTER {
@@ -142,7 +158,15 @@ pub fn draw_stamina_arc(frame: &mut Frame, cx: i32, cy: i32, frac: f32, color: u
                 continue; // the bottom gap
             }
             let t = (ang + ARC_HALF_SPAN) / span;
-            let c = if t <= frac { color } else { COL_TRACK };
+            let mut c = if t <= frac { color } else { COL_TRACK };
+            if stripe && t <= frac {
+                // ~10 stripe bands across the full 270-degree sweep: every
+                // other band darkened toward the track color.
+                let band = (t * 10.0) as i32;
+                if band % 2 == 1 {
+                    c = COL_TRACK;
+                }
+            }
             frame.set(cx + dx, cy + dy, c);
         }
     }
@@ -152,9 +176,16 @@ pub fn draw_stamina_arc(frame: &mut Frame, cx: i32, cy: i32, frac: f32, color: u
 /// top's accent (flashing white at <= 20% spin, timed off `ui_frame`), RPM
 /// numeral, and the 0..100 meter bar with an Armed glow (brighter fill +
 /// pulsing border once the meter is full).
-pub fn draw_player_panel(frame: &mut Frame, panel: &PlayerPanel, right_side: bool, ui_frame: u32) {
+pub fn draw_player_panel(
+    frame: &mut Frame,
+    panel: &PlayerPanel,
+    right_side: bool,
+    ui_frame: u32,
+    colorblind: bool,
+) {
     let w = frame.w as i32;
     let frac = (panel.spin / panel.spin_max).clamp(0.0, 1.0);
+    let accent = vfx::colorblind_remap(panel.accent, colorblind);
 
     // Low-spin flash: white on a fast blink (render-only timing from the
     // caller-supplied frame counter, game_design.md §7).
@@ -162,8 +193,11 @@ pub fn draw_player_panel(frame: &mut Frame, panel: &PlayerPanel, right_side: boo
     let arc_color = if low && (ui_frame / 6).is_multiple_of(2) {
         COL_ICE
     } else {
-        panel.accent
+        accent
     };
+    // Colorblind mode (game_design.md §7): P2's (right-side) arc gets a
+    // stripe pattern so hue is never the sole signal.
+    let stripe = colorblind && right_side;
 
     let (arc_cx, name_x, text_x) = if right_side {
         let (name_w, _) = text::measure(panel.name, 2);
@@ -172,8 +206,8 @@ pub fn draw_player_panel(frame: &mut Frame, panel: &PlayerPanel, right_side: boo
         (40, 14, 76)
     };
 
-    text::draw_text(frame, name_x, 10, 2, panel.accent, panel.name);
-    draw_stamina_arc(frame, arc_cx, 74, frac, arc_color);
+    text::draw_text(frame, name_x, 10, 2, accent, panel.name);
+    draw_stamina_arc(frame, arc_cx, 74, frac, arc_color, stripe);
 
     // RPM numeral (plain scaled font — vector-AA numerals are M7 polish).
     let rpm = format!("{:>5}", panel.spin.max(0.0) as i32);
@@ -189,32 +223,70 @@ pub fn draw_player_panel(frame: &mut Frame, panel: &PlayerPanel, right_side: boo
     let bar_h = 8;
     let fill_w = ((panel.meter.clamp(0.0, 100.0) / 100.0) * bar_w as f32) as i32;
     fill_rect(frame, bar_x, bar_y, bar_w, bar_h, COL_TRACK);
-    let fill_color = if armed { COL_ICE } else { panel.accent };
+    let fill_color = if armed { COL_ICE } else { accent };
     fill_rect(frame, bar_x, bar_y, fill_w, bar_h, fill_color);
     let border = if armed && (ui_frame / 8).is_multiple_of(2) {
         COL_ICE
     } else if armed {
-        panel.accent
+        accent
     } else {
         COL_DIM
     };
     rect_outline(frame, bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, border);
 }
 
+/// Small filled circle (colorblind P1 shape tag — game_design.md §7: "P1
+/// (circle)"), stamped inside a filled pip in a contrasting dark color so it
+/// reads regardless of hue.
+fn draw_mini_circle(frame: &mut Frame, cx: i32, cy: i32, r: i32, color: u32) {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r * r {
+                frame.set(cx + dx, cy + dy, color);
+            }
+        }
+    }
+}
+
+/// Small filled upward triangle (colorblind P2 shape tag — game_design.md
+/// §7: "P2 (triangle)").
+fn draw_mini_triangle(frame: &mut Frame, cx: i32, cy: i32, r: i32, color: u32) {
+    for dy in -r..=r {
+        let half_width = (dy + r) / 2;
+        for dx in -half_width..=half_width {
+            frame.set(cx + dx, cy + dy, color);
+        }
+    }
+}
+
 /// Score pips (game_design.md §7): 4 hollow neon diamonds per side of
 /// center-top, filled left-to-right (P1) / right-to-left toward center (P2)
-/// as points accrue; a 3-point Crash-Out simply fills 3 at once.
-pub fn draw_score_pips(frame: &mut Frame, score: [u8; 2], accents: [u32; 2]) {
+/// as points accrue; a 3-point Crash-Out simply fills 3 at once. Colorblind
+/// mode (game_design.md §7) stamps a small shape tag inside every FILLED pip
+/// — circle for P1, triangle for P2 — so score is never read by hue alone.
+pub fn draw_score_pips(frame: &mut Frame, score: [u8; 2], accents: [u32; 2], colorblind: bool) {
     let cx = frame.w as i32 / 2;
     let y = 24;
     let r = 8;
     let gap = 26;
+    let accents = [
+        vfx::colorblind_remap(accents[0], colorblind),
+        vfx::colorblind_remap(accents[1], colorblind),
+    ];
     for k in 0..4i32 {
         // P1 pips grow leftward from center; nearest-to-center = first point.
         let filled_p1 = (k as u8) < score[0].min(4);
-        draw_diamond(frame, cx - 24 - k * gap, y, r, accents[0], filled_p1);
+        let x1 = cx - 24 - k * gap;
+        draw_diamond(frame, x1, y, r, accents[0], filled_p1);
+        if colorblind && filled_p1 {
+            draw_mini_circle(frame, x1, y, r / 3, COL_SHADOW);
+        }
         let filled_p2 = (k as u8) < score[1].min(4);
-        draw_diamond(frame, cx + 24 + k * gap, y, r, accents[1], filled_p2);
+        let x2 = cx + 24 + k * gap;
+        draw_diamond(frame, x2, y, r, accents[1], filled_p2);
+        if colorblind && filled_p2 {
+            draw_mini_triangle(frame, x2, y, r / 3, COL_SHADOW);
+        }
     }
 }
 
@@ -226,6 +298,7 @@ pub fn draw_battle_hud(
     visuals: [&Preset; 2],
     score: [u8; 2],
     ui_frame: u32,
+    colorblind: bool,
 ) {
     let p1 = PlayerPanel {
         name: visuals[0].name,
@@ -241,9 +314,14 @@ pub fn draw_battle_hud(
         spin_max: TUNE.spin_max,
         meter: world.tops[1].meter,
     };
-    draw_player_panel(frame, &p1, false, ui_frame);
-    draw_player_panel(frame, &p2, true, ui_frame);
-    draw_score_pips(frame, score, [visuals[0].accent, visuals[1].accent]);
+    draw_player_panel(frame, &p1, false, ui_frame, colorblind);
+    draw_player_panel(frame, &p2, true, ui_frame, colorblind);
+    draw_score_pips(
+        frame,
+        score,
+        [visuals[0].accent, visuals[1].accent],
+        colorblind,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -259,15 +337,82 @@ pub fn draw_boot(frame: &mut Frame, ui_frame: u32) {
     draw_text_centered(frame, 290, 2, COL_DIM, s);
 }
 
+/// Ring outline (game_design.md §7 title screen: "neon-ring backdrop"): a
+/// bounding-box distance-test annulus, same technique as `draw_diamond`'s
+/// Manhattan-distance test but circular (`fixmath`-free — plain squared
+/// distance, no `sqrt` needed since both bounds are compared squared).
+fn draw_ring_outline(frame: &mut Frame, cx: i32, cy: i32, r: i32, thickness: i32, color: u32) {
+    let r_in = (r - thickness).max(0);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r * r && d2 >= r_in * r_in {
+                frame.set(cx + dx, cy + dy, color);
+            }
+        }
+    }
+}
+
+fn dim_color(c: u32, k: f32) -> u32 {
+    let k = k.clamp(0.0, 1.0);
+    let r = (((c >> 16) & 0xFF) as f32 * k) as u32;
+    let g = (((c >> 8) & 0xFF) as f32 * k) as u32;
+    let b = ((c & 0xFF) as f32 * k) as u32;
+    (r << 16) | (g << 8) | b
+}
+
+/// Idle spinning top with a fading trail (game_design.md §7 title screen).
+/// The title screen has no 3D camera (it's a flat 2D HUD screen — the
+/// lathed-mesh tops only ever appear via `BattleScene`'s battle camera), so
+/// this is a deliberate 2D approximation: a small diamond orbiting `(cx,
+/// cy)` on a squashed ellipse (reads as a top's rim seen from slightly
+/// above), with several dimmer ghost copies at earlier angles for the
+/// trail. Fully deterministic from `ui_frame` (`fixmath::sin`/`cos`, no
+/// wall-clock, no RNG).
+fn draw_idle_top(frame: &mut Frame, cx: i32, cy: i32, ui_frame: u32) {
+    const ORBIT_R: f32 = 60.0;
+    const SPEED: f32 = 0.06;
+    const TRAIL: i32 = 6;
+    for i in (0..TRAIL).rev() {
+        let t = (ui_frame as i32 - i * 2).max(0) as f32;
+        let angle = t * SPEED;
+        let ox = fixmath::cos(angle) * ORBIT_R;
+        let oy = fixmath::sin(angle) * ORBIT_R * 0.4;
+        let fade = 1.0 - (i as f32 / TRAIL as f32) * 0.85;
+        let sz = if i == 0 { 5 } else { 3 };
+        let color = dim_color(COL_ICE, fade);
+        draw_diamond(frame, cx + ox as i32, cy + oy as i32, sz, color, true);
+    }
+}
+
 pub fn draw_title(frame: &mut Frame, ui_frame: u32) {
-    // Chunky title: cyan fill with a magenta drop-offset (game_design.md §7;
-    // the vector version with sine jitter is M7).
+    // Neon ring backdrop (game_design.md §7) + idle spinning top with a
+    // trail, both centered above the title text.
+    let ring_cx = frame.w as i32 / 2;
+    let ring_cy = 210;
+    draw_ring_outline(frame, ring_cx, ring_cy, 150, 2, dim_color(COL_CURSOR, 0.5));
+    draw_ring_outline(frame, ring_cx, ring_cy, 110, 2, dim_color(0x00FF_2D7D, 0.6));
+    draw_ring_outline(frame, ring_cx, ring_cy, 75, 2, dim_color(COL_CURSOR, 0.8));
+    draw_idle_top(frame, ring_cx, ring_cy, ui_frame);
+
+    // Chunky title: cyan fill with a magenta drop-offset that jitters
+    // +-0.5px over time (game_design.md §7; see `vfx::title_shadow_jitter_px`
+    // for why the continuous +-0.5px signal is quantized to a whole extra
+    // pixel here — the bitmap font has no sub-pixel rendering).
     let title = "FLOPPY SPIN";
     let scale = 7;
     let (tw, th) = text::measure(title, scale);
     let x = (frame.w as i32 - tw as i32) / 2;
     let y = 140;
-    text::draw_text(frame, x + 4, y + 4, scale, 0x00B0_1878, title);
+    let jitter = vfx::title_shadow_jitter_px(ui_frame);
+    text::draw_text(
+        frame,
+        x + 4 + jitter,
+        y + 4 + jitter,
+        scale,
+        0x00B0_1878,
+        title,
+    );
     text::draw_text(frame, x, y, scale, COL_CURSOR, title);
     // Accent underline.
     fill_rect(frame, x, y + th as i32 + 10, tw as i32, 4, COL_CURSOR);
@@ -276,10 +421,15 @@ pub fn draw_title(frame: &mut Frame, ui_frame: u32) {
     if (ui_frame / 36).is_multiple_of(2) {
         draw_text_centered(frame, 380, 2, COL_ICE, "PRESS ANY KEY");
     }
-    draw_text_centered(frame, 505, 1, COL_DIM, "M4 BUILD - ESC QUITS");
+    draw_text_centered(frame, 505, 1, COL_DIM, "M7 BUILD - ESC QUITS");
 }
 
-pub fn draw_main_menu(frame: &mut Frame, cursor: usize, ui_frame: u32) {
+/// `cursor` picks which item is highlighted (text color snaps instantly);
+/// `cursor_anim` is the caller-owned [`vfx::Spring`]'s CURRENT eased
+/// fractional row index (game_design.md §7: "glowing chevron cursor with
+/// ~120 ms spring settle") — the chevron glyph itself is drawn at this
+/// continuously-eased position instead of snapping row-to-row.
+pub fn draw_main_menu(frame: &mut Frame, cursor: usize, cursor_anim: f32, ui_frame: u32) {
     draw_text_centered(frame, 80, 4, COL_CURSOR, "FLOPPY SPIN");
     let x = 400;
     let y0 = 240;
@@ -288,13 +438,13 @@ pub fn draw_main_menu(frame: &mut Frame, cursor: usize, ui_frame: u32) {
         let y = y0 + (i as i32) * row_h;
         let selected = i == cursor;
         let color = if selected { COL_ICE } else { COL_DIM };
-        if selected {
-            // Glowing chevron cursor with a subtle 2-frame bob.
-            let bob = ((ui_frame / 16) % 2) as i32;
-            text::draw_text(frame, x - 24 + bob, y, 2, COL_CURSOR, ">");
-        }
         text::draw_text(frame, x, y, 2, color, item);
     }
+    // Glowing chevron cursor with a subtle 2-frame bob, at the spring-eased
+    // y position.
+    let bob = ((ui_frame / 16) % 2) as i32;
+    let cursor_y = y0 + (cursor_anim * row_h as f32) as i32;
+    text::draw_text(frame, x - 24 + bob, cursor_y, 2, COL_CURSOR, ">");
     draw_text_centered(
         frame,
         500,
@@ -316,7 +466,7 @@ pub fn draw_garage_stub(frame: &mut Frame) {
     draw_text_centered(frame, 500, 1, COL_DIM, "Z/ESC BACK");
 }
 
-pub fn draw_settings(frame: &mut Frame, settings: &GameSettings, cursor: usize) {
+pub fn draw_settings(frame: &mut Frame, settings: &GameSettings, cursor: usize, cursor_anim: f32) {
     draw_text_centered(frame, 80, 3, COL_CURSOR, "SETTINGS");
 
     let labels = [
@@ -344,17 +494,16 @@ pub fn draw_settings(frame: &mut Frame, settings: &GameSettings, cursor: usize) 
         let y = y0 + (i as i32) * row_h;
         let selected = i == cursor;
         let color = if selected { COL_ICE } else { COL_DIM };
-        if selected {
-            text::draw_text(frame, label_x - 24, y, 2, COL_CURSOR, ">");
-        }
         text::draw_text(frame, label_x, y, 2, color, labels[i]);
         let (vw, _) = text::measure(&values[i], 2);
         text::draw_text(frame, value_right - vw as i32, y, 2, color, &values[i]);
     }
+    let cursor_y = y0 + (cursor_anim * row_h as f32) as i32;
+    text::draw_text(frame, label_x - 24, cursor_y, 2, COL_CURSOR, ">");
     draw_text_centered(frame, 500, 1, COL_DIM, "ARROWS ADJUST - Z/ESC BACK");
 }
 
-pub fn draw_top_select(frame: &mut Frame, cursor: usize, ui_frame: u32) {
+pub fn draw_top_select(frame: &mut Frame, cursor: usize, cursor_anim: f32, ui_frame: u32) {
     draw_text_centered(frame, 40, 3, COL_CURSOR, "SELECT YOUR TOP");
 
     // Left column: the 7 preset names, hovered one in its accent.
@@ -365,12 +514,12 @@ pub fn draw_top_select(frame: &mut Frame, cursor: usize, ui_frame: u32) {
         let y = y0 + (i as i32) * row_h;
         let selected = i == cursor;
         let color = if selected { p.accent } else { COL_DIM };
-        if selected {
-            let bob = ((ui_frame / 16) % 2) as i32;
-            text::draw_text(frame, list_x - 24 + bob, y, 2, p.accent, ">");
-        }
         text::draw_text(frame, list_x, y, 2, color, p.name);
     }
+    let bob = ((ui_frame / 16) % 2) as i32;
+    let cursor_y = y0 + (cursor_anim * row_h as f32) as i32;
+    let cursor_accent = PRESETS[cursor.min(PRESETS.len() - 1)].accent;
+    text::draw_text(frame, list_x - 24 + bob, cursor_y, 2, cursor_accent, ">");
 
     // Right panel: hovered preset's stats as labeled bars.
     let p = &PRESETS[cursor.min(PRESETS.len() - 1)];
@@ -539,8 +688,27 @@ pub fn draw_launch_ui(frame: &mut Frame, mg: &MinigameState, opponent_spin_dir: 
 // Round result / match over.
 // ---------------------------------------------------------------------------
 
+/// Frames per pip during the RoundResult tally (game_design.md §7: "tallies
+/// pips with a ting each 120 ms" -> 120 ms @ 60 Hz = 7.2 frames, rounded to
+/// 7).
+pub const TALLY_FRAMES_PER_PIP: u32 = 7;
+
+/// How many of the round winner's newly-earned points have "landed" by
+/// `frame` (frames since RoundResult was entered — i.e. its own `ui_frame`,
+/// which resets to 0 on every screen transition per `flow::FlowState`). Pure
+/// function of `(frame, last_points)`; `main.rs` calls this itself each
+/// frame to detect the edge and fire `Sfx::ScoreTally` once per newly-landed
+/// pip (module docs: "main.rs edge").
+pub fn tally_pip_count(frame: u32, last_points: u8) -> u8 {
+    ((frame / TALLY_FRAMES_PER_PIP) as u8).min(last_points)
+}
+
 /// Inter-round tally screen content (drawn over the frozen fight frame or a
-/// cleared background — caller's choice).
+/// cleared background — caller's choice). `last_winner`/`last_points`
+/// (mirroring `flow::FlowState`'s own fields) animate the WINNER's pips
+/// filling in one at a time (game_design.md §7) rather than snapping
+/// straight to the final `score`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_round_result(
     frame: &mut Frame,
     round: u32,
@@ -548,6 +716,9 @@ pub fn draw_round_result(
     accents: [u32; 2],
     result_line: &str,
     ui_frame: u32,
+    last_winner: Option<u8>,
+    last_points: u8,
+    colorblind: bool,
 ) {
     draw_text_centered(frame, 120, 3, COL_CURSOR, &format!("ROUND {}", round + 1));
     draw_text_centered(frame, 200, 3, COL_ICE, result_line);
@@ -558,16 +729,33 @@ pub fn draw_round_result(
         COL_TEXT,
         &format!("P1 {}  -  {} CPU", score[0], score[1]),
     );
-    draw_score_pips(frame, score, accents);
+    let mut display_score = score;
+    if let Some(winner) = last_winner {
+        let tallied = tally_pip_count(ui_frame, last_points);
+        display_score[winner as usize] = score[winner as usize]
+            .saturating_sub(last_points)
+            .saturating_add(tallied);
+    }
+    draw_score_pips(frame, display_score, accents, colorblind);
     if (ui_frame / 24).is_multiple_of(2) {
         draw_text_centered(frame, 420, 2, COL_ICE, "PRESS ANY KEY");
     }
 }
 
-/// Match-over screen: winner banner + final score (gold fountain is M6 VFX).
-pub fn draw_match_over(frame: &mut Frame, p1_won: bool, score: [u8; 2], ui_frame: u32) {
+/// Match-over screen: winner banner (slam-in overshoot — `banner_scale` is
+/// the caller-owned `vfx::OvershootSpring`'s current value, game_design.md
+/// §7: "slam in at 1.5x overshoot") + final score. The gold fountain
+/// particle burst is drawn separately by the caller (M7 particle pool, not a
+/// HUD-text concern).
+pub fn draw_match_over(
+    frame: &mut Frame,
+    p1_won: bool,
+    score: [u8; 2],
+    ui_frame: u32,
+    banner_scale: f32,
+) {
     let banner = if p1_won { "P1 WINS!" } else { "CPU WINS!" };
-    draw_banner(frame, banner, 6, COL_GOLD);
+    draw_banner_scaled(frame, banner, banner_scale, COL_GOLD);
     draw_text_centered(
         frame,
         330,
@@ -615,15 +803,15 @@ mod tests {
     #[test]
     fn stamina_arc_fill_fraction_scales_with_frac() {
         let mut f_full = frame();
-        draw_stamina_arc(&mut f_full, 100, 100, 1.0, COL_ICE);
+        draw_stamina_arc(&mut f_full, 100, 100, 1.0, COL_ICE, false);
         let full = f_full.px.iter().filter(|&&p| p == COL_ICE).count();
 
         let mut f_half = frame();
-        draw_stamina_arc(&mut f_half, 100, 100, 0.5, COL_ICE);
+        draw_stamina_arc(&mut f_half, 100, 100, 0.5, COL_ICE, false);
         let half = f_half.px.iter().filter(|&&p| p == COL_ICE).count();
 
         let mut f_zero = frame();
-        draw_stamina_arc(&mut f_zero, 100, 100, 0.0, COL_ICE);
+        draw_stamina_arc(&mut f_zero, 100, 100, 0.0, COL_ICE, false);
         let zero = f_zero.px.iter().filter(|&&p| p == COL_ICE).count();
 
         assert!(full > 0);
@@ -632,6 +820,22 @@ mod tests {
         assert!(
             (0.4..=0.6).contains(&ratio),
             "half arc should be ~half the full arc: {half}/{full}"
+        );
+    }
+
+    #[test]
+    fn stamina_arc_stripe_darkens_part_of_the_filled_arc() {
+        let mut f_plain = frame();
+        draw_stamina_arc(&mut f_plain, 100, 100, 1.0, COL_ICE, false);
+        let plain = f_plain.px.iter().filter(|&&p| p == COL_ICE).count();
+
+        let mut f_striped = frame();
+        draw_stamina_arc(&mut f_striped, 100, 100, 1.0, COL_ICE, true);
+        let striped = f_striped.px.iter().filter(|&&p| p == COL_ICE).count();
+
+        assert!(
+            striped < plain,
+            "striped arc should show less solid accent color: striped={striped} plain={plain}"
         );
     }
 
@@ -646,21 +850,33 @@ mod tests {
         let draws: Vec<(&str, DrawFn)> = vec![
             ("boot", Box::new(|f| draw_boot(f, 7))),
             ("title", Box::new(|f| draw_title(f, 10))),
-            ("menu", Box::new(|f| draw_main_menu(f, 2, 30))),
+            ("menu", Box::new(|f| draw_main_menu(f, 2, 2.0, 30))),
             ("garage", Box::new(draw_garage_stub)),
             (
                 "settings",
-                Box::new(move |f| draw_settings(f, &settings, 3)),
+                Box::new(move |f| draw_settings(f, &settings, 3, 3.0)),
             ),
-            ("select", Box::new(|f| draw_top_select(f, 4, 5))),
+            ("select", Box::new(|f| draw_top_select(f, 4, 4.0, 5))),
             ("launch", Box::new(move |f| draw_launch_ui(f, &mg, -1, 12))),
             (
                 "result",
-                Box::new(|f| draw_round_result(f, 2, [3, 1], [COL_WARN, COL_GOLD], "TOPPLE!", 3)),
+                Box::new(|f| {
+                    draw_round_result(
+                        f,
+                        2,
+                        [3, 1],
+                        [COL_WARN, COL_GOLD],
+                        "TOPPLE!",
+                        3,
+                        Some(0),
+                        1,
+                        false,
+                    )
+                }),
             ),
             (
                 "matchover",
-                Box::new(|f| draw_match_over(f, true, [4, 2], 0)),
+                Box::new(|f| draw_match_over(f, true, [4, 2], 0, 1.2)),
             ),
         ];
 
@@ -681,16 +897,37 @@ mod tests {
     #[test]
     fn score_pips_fill_matches_score_and_crash_out_style_jumps() {
         let mut f0 = frame();
-        draw_score_pips(&mut f0, [0, 0], [COL_WARN, COL_GOLD]);
+        draw_score_pips(&mut f0, [0, 0], [COL_WARN, COL_GOLD], false);
         let empty_warn = f0.px.iter().filter(|&&p| p == COL_WARN).count();
 
         let mut f3 = frame();
-        draw_score_pips(&mut f3, [3, 0], [COL_WARN, COL_GOLD]);
+        draw_score_pips(&mut f3, [3, 0], [COL_WARN, COL_GOLD], false);
         let filled_warn = f3.px.iter().filter(|&&p| p == COL_WARN).count();
         assert!(
             filled_warn > empty_warn * 2,
             "3 filled pips must paint far more accent pixels than 4 hollow ones"
         );
+    }
+
+    #[test]
+    fn score_pips_colorblind_mode_stamps_shape_tags_without_changing_score() {
+        let mut plain = frame();
+        draw_score_pips(&mut plain, [2, 3], [COL_WARN, COL_GOLD], false);
+        let mut cb = frame();
+        draw_score_pips(&mut cb, [2, 3], [COL_WARN, COL_GOLD], true);
+        assert_ne!(
+            hash_u32s(&plain.px),
+            hash_u32s(&cb.px),
+            "colorblind mode should visibly stamp shape tags"
+        );
+    }
+
+    #[test]
+    fn tally_pip_count_advances_one_pip_per_120ms_and_caps_at_last_points() {
+        assert_eq!(tally_pip_count(0, 3), 0);
+        assert_eq!(tally_pip_count(TALLY_FRAMES_PER_PIP, 3), 1);
+        assert_eq!(tally_pip_count(TALLY_FRAMES_PER_PIP * 2, 3), 2);
+        assert_eq!(tally_pip_count(TALLY_FRAMES_PER_PIP * 10, 3), 3);
     }
 
     #[test]
@@ -703,13 +940,36 @@ mod tests {
             meter: 40.0,
         };
         let mut on = frame();
-        draw_player_panel(&mut on, &panel, false, 0); // (0/6)%2 == 0 -> white
+        draw_player_panel(&mut on, &panel, false, 0, false); // (0/6)%2 == 0 -> white
         let mut off = frame();
-        draw_player_panel(&mut off, &panel, false, 6); // (6/6)%2 == 1 -> accent
+        draw_player_panel(&mut off, &panel, false, 6, false); // (6/6)%2 == 1 -> accent
         assert_ne!(
             hash_u32s(&on.px),
             hash_u32s(&off.px),
             "low-spin flash must alternate with ui_frame"
+        );
+    }
+
+    #[test]
+    fn player_panel_colorblind_remaps_lime_accent_to_ice_blue() {
+        let panel = PlayerPanel {
+            name: "EVERSPIN",
+            accent: 0x0039_FF14, // lime (Everspin's roster accent)
+            spin: 8000.0,
+            spin_max: 10_000.0,
+            meter: 10.0,
+        };
+        let mut plain = frame();
+        draw_player_panel(&mut plain, &panel, false, 0, false);
+        let mut cb = frame();
+        draw_player_panel(&mut cb, &panel, false, 0, true);
+        assert!(
+            plain.px.contains(&0x0039_FF14),
+            "plain mode should show the raw lime accent"
+        );
+        assert!(
+            !cb.px.contains(&0x0039_FF14),
+            "colorblind mode should never show raw lime"
         );
     }
 }

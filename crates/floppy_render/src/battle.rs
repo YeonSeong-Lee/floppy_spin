@@ -6,6 +6,8 @@
 use crate::camera::Camera;
 use crate::frame::Frame;
 use crate::mesh::{self, Mesh};
+use crate::particles::ParticlePool;
+use crate::post::PostState;
 use crate::scene::{self, Instance};
 use crate::shade::Material;
 use floppy_core::arena;
@@ -214,7 +216,9 @@ fn build_top_mesh(s: Silhouette) -> Mesh {
     }
 }
 
-fn accent_to_vec3(accent: u32) -> Vec3 {
+/// Unpack a `0x00RRGGBB` roster accent into a `[0,1]`-range `Vec3` (M7:
+/// shared with `main.rs`'s particle-color wiring, so it's `pub`).
+pub fn accent_to_vec3(accent: u32) -> Vec3 {
     let r = ((accent >> 16) & 0xFF) as f32 / 255.0;
     let g = ((accent >> 8) & 0xFF) as f32 / 255.0;
     let b = (accent & 0xFF) as f32 / 255.0;
@@ -389,6 +393,109 @@ impl BattleScene {
                 scene::draw_instance(frame, &cam, &shadow_inst);
             }
         }
+    }
+
+    /// M7 bloom/particle/shake/ring-pulse pipeline: same scene as [`draw`],
+    /// but through the bloom-tagged raster path (`scene::draw_instance_bloom`
+    /// & co — game_design.md §6), with the whole 3D scene offset by `shake`
+    /// whole pixels (game_design.md §5; HUD is drawn separately, unshifted,
+    /// by the caller), the arena rings' emissive intensity scaled by
+    /// `1.0 + ring_pulse` (game_design.md §6 "arena rings pulse on music
+    /// downbeats"), and `particles` drawn on top of the tops/shadows.
+    /// Self-contained like `draw`: clears `frame` AND `post`'s bright buffer
+    /// at the top. Does NOT itself run `post.composite` — the caller does
+    /// that once, after HUD is drawn on top, so scanline/vignette/dither
+    /// unify the WHOLE frame while bloom (spatially tied to `post.bright`)
+    /// only lights up the 3D scene/particles that actually tagged it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_ex(
+        &self,
+        frame: &mut Frame,
+        post: &mut PostState,
+        world_prev: &World,
+        world_curr: &World,
+        alpha: f32,
+        visuals: [&Preset; 2],
+        ring_pulse: f32,
+        shake: (f32, f32),
+        particles: &ParticlePool,
+    ) {
+        frame.clear(CLEAR_COLOR);
+        post.begin_frame();
+        let cam = make_camera(frame.w, frame.h);
+
+        let arena_inst = Instance {
+            mesh: &self.arena_mesh,
+            offset: Vec3::default(),
+            yaw: 0.0,
+            tilt: Vec2::default(),
+            material: ARENA_MATERIAL,
+            radial_scale: 1.0,
+            height_scale: 1.0,
+        };
+        scene::draw_instance_bloom(frame, &mut post.bright, &cam, &arena_inst, shake);
+
+        let ring_gain = 1.0 + ring_pulse;
+        for ring_mesh in &self.ring_meshes {
+            let pulsed_material = Material {
+                emissive: RING_MATERIAL.emissive * ring_gain,
+                ..RING_MATERIAL
+            };
+            let ring_inst = Instance {
+                mesh: ring_mesh,
+                offset: Vec3::default(),
+                yaw: 0.0,
+                tilt: Vec2::default(),
+                material: pulsed_material,
+                radial_scale: 1.0,
+                height_scale: 1.0,
+            };
+            scene::draw_instance_additive_bloom(frame, &mut post.bright, &cam, &ring_inst, shake);
+        }
+
+        for (i, &preset) in visuals.iter().enumerate() {
+            let prev = &world_prev.tops[i];
+            let curr = &world_curr.tops[i];
+            let pose = physics::pose_lerp(prev, curr, alpha);
+            let top_mesh = self.top_mesh(preset.silhouette);
+            let base_material = base_material_for(preset.accent);
+            let emissive_material = emissive_material_for(preset.accent);
+
+            let top_inst = Instance {
+                mesh: top_mesh,
+                offset: pose.pos,
+                yaw: pose.spin_angle,
+                tilt: pose.tilt,
+                material: base_material,
+                radial_scale: pose.radius,
+                height_scale: pose.height,
+            };
+            scene::draw_instance_split_bloom(
+                frame,
+                &mut post.bright,
+                &cam,
+                &top_inst,
+                &emissive_material,
+                |idx| top_mesh.verts[idx].y > EMISSIVE_HEIGHT_FRAC,
+                shake,
+            );
+
+            if !curr.grounded {
+                let ground_y = arena::height(pose.pos.x, pose.pos.z) + SHADOW_Y_OFFSET;
+                let shadow_inst = Instance {
+                    mesh: &self.shadow_mesh,
+                    offset: Vec3::new(pose.pos.x, ground_y, pose.pos.z),
+                    yaw: 0.0,
+                    tilt: Vec2::default(),
+                    material: SHADOW_MATERIAL,
+                    radial_scale: 1.0,
+                    height_scale: 1.0,
+                };
+                scene::draw_instance_bloom(frame, &mut post.bright, &cam, &shadow_inst, shake);
+            }
+        }
+
+        particles.draw(frame, &mut post.bright, &cam, shake);
     }
 }
 
@@ -615,5 +722,99 @@ mod tests {
             hash_air, hash_grounded,
             "expected the shadow blob to change the rendered frame"
         );
+    }
+
+    #[test]
+    fn draw_ex_is_deterministic_and_matches_plain_draw_at_zero_state() {
+        use crate::particles::ParticlePool;
+        use crate::post::PostState;
+
+        let scene = BattleScene::new();
+        let world = launch_world();
+        let visuals = [
+            preset_for(Silhouette::Cleaver),
+            preset_for(Silhouette::Bulwark),
+        ];
+
+        let mut frame_plain = Frame::new(W, H);
+        scene.draw(&mut frame_plain, &world, &world, 1.0, visuals);
+
+        let mut frame_ex_a = Frame::new(W, H);
+        let mut post_a = PostState::new(W, H);
+        let particles_a = ParticlePool::new();
+        scene.draw_ex(
+            &mut frame_ex_a,
+            &mut post_a,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &particles_a,
+        );
+
+        // At ring_pulse=0/shake=(0,0)/no particles, `draw_ex`'s SCENE layer
+        // (pre-`post.composite`) must paint pixel-identical to plain `draw`
+        // — bloom tagging only ever ADDS a side-channel (`post.bright`), it
+        // never changes what lands in `frame.px` itself.
+        assert_eq!(frame_plain.px, frame_ex_a.px);
+
+        // Determinism: an independent second run with identical inputs must
+        // match exactly, including the (side-channel) bright buffer's
+        // effect once composited.
+        let mut frame_ex_b = Frame::new(W, H);
+        let mut post_b = PostState::new(W, H);
+        let particles_b = ParticlePool::new();
+        scene.draw_ex(
+            &mut frame_ex_b,
+            &mut post_b,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &particles_b,
+        );
+        post_a.composite(&mut frame_ex_a, Vec3::default());
+        post_b.composite(&mut frame_ex_b, Vec3::default());
+        assert_eq!(frame_ex_a.px, frame_ex_b.px);
+
+        // Nonzero shake must offset the painted scene (sanity that the
+        // shake parameter actually reaches the raster).
+        let mut frame_shaken = Frame::new(W, H);
+        let mut post_c = PostState::new(W, H);
+        let particles_c = ParticlePool::new();
+        scene.draw_ex(
+            &mut frame_shaken,
+            &mut post_c,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (6.0, -4.0),
+            &particles_c,
+        );
+        assert_ne!(frame_plain.px, frame_shaken.px);
+
+        // Nonzero ring_pulse must brighten the (additive) ring bands
+        // somewhere, changing the frame.
+        let mut frame_pulsed = Frame::new(W, H);
+        let mut post_d = PostState::new(W, H);
+        let particles_d = ParticlePool::new();
+        scene.draw_ex(
+            &mut frame_pulsed,
+            &mut post_d,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            1.0,
+            (0.0, 0.0),
+            &particles_d,
+        );
+        assert_ne!(frame_plain.px, frame_pulsed.px);
     }
 }

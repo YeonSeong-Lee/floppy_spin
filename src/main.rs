@@ -4,14 +4,21 @@
 mod platform;
 
 use floppy_audio::{on_event, play, Mixer, Sfx, SongId, Tracker};
+use floppy_core::arena;
 use floppy_core::clock::SimClock;
+use floppy_core::combat;
+use floppy_core::fixmath;
 use floppy_core::flow::{self, FlowState, MatchPhase, Screen, MATCH_WIN_POINTS};
 use floppy_core::input::InputState;
-use floppy_core::physics::TUNE;
-use floppy_core::roster::PRESETS;
-use floppy_render::battle::BattleScene;
+use floppy_core::physics::{self, BattleEvent, TUNE};
+use floppy_core::rng::Rng;
+use floppy_core::roster::{Preset, PRESETS};
+use floppy_core::vec::Vec2;
+use floppy_render::battle::{accent_to_vec3, BattleScene};
 use floppy_render::frame::Frame;
-use floppy_render::hud;
+use floppy_render::particles::{self, ParticlePool};
+use floppy_render::post::PostState;
+use floppy_render::{hud, vfx};
 use platform::win32::{Platform, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
@@ -69,9 +76,340 @@ fn read_input(p: &Platform) -> InputState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M7: render-side VFX state (Tasks 2/3/4/5). Everything here is plain data
+// driven only by `BattleEvent`s / sim state / flow-screen transitions / a
+// dedicated render-side `Rng` (SPEC §5 "HARD RULES" — never `World`'s own
+// `rng`, never wall-clock). One `Vfx` instance lives for the process
+// lifetime (like `Mixer`); its `rng` is reseeded per ROUND (module docs on
+// `advance_vfx_for_flow_frame`), everything else just decays/eases forward.
+// ---------------------------------------------------------------------------
+
+/// Salt XORed into the round seed for the dedicated render-side VFX `Rng`
+/// stream (distinct from `flow.rs`'s own `AI_ROLL_SEED_SALT`/
+/// `AI_FIGHT_SEED_SALT` and from `World`'s own `rng` — SPEC §5's "HARD
+/// RULES" bans reusing the sim's RNG for anything render-visible).
+const VFX_RNG_SALT: u64 = 0x00F7_0000_0000_0001;
+
+struct Vfx {
+    post: PostState,
+    particles: ParticlePool,
+    shake: vfx::ShakeState,
+    flash: vfx::FlashState,
+    /// Arena ring-pulse intensity (Task 4), decayed/kicked in the audio
+    /// submission loop below (that's where `Tracker::row_index()` actually
+    /// advances).
+    ring_pulse: f32,
+    rng: Rng,
+    menu_spring: vfx::Spring,
+    select_spring: vfx::Spring,
+    settings_spring: vfx::Spring,
+    intro_scale: vfx::OvershootSpring,
+    decided_scale: vfx::OvershootSpring,
+    matchover_scale: vfx::OvershootSpring,
+    prev_round_seed: u64,
+    prev_intro_banner: &'static str,
+    prev_tally: u8,
+    prev_tracker_row: u32,
+    prev_screen: Screen,
+    wipe_frame: u32,
+}
+
+impl Vfx {
+    fn new() -> Self {
+        Self {
+            post: PostState::new(W, H),
+            particles: ParticlePool::new(),
+            shake: vfx::ShakeState::default(),
+            flash: vfx::FlashState::new(),
+            ring_pulse: 0.0,
+            rng: Rng::new(1),
+            menu_spring: vfx::Spring::new(0.0),
+            select_spring: vfx::Spring::new(0.0),
+            settings_spring: vfx::Spring::new(0.0),
+            intro_scale: vfx::OvershootSpring::default(),
+            decided_scale: vfx::OvershootSpring::default(),
+            matchover_scale: vfx::OvershootSpring::default(),
+            prev_round_seed: 0,
+            prev_intro_banner: "",
+            prev_tally: 0,
+            prev_tracker_row: 0,
+            prev_screen: Screen::Boot,
+            wipe_frame: vfx::WIPE_FRAMES, // settled: no wipe plays on boot
+        }
+    }
+}
+
+/// ms -> 60Hz render frames (juice-table durations are given in ms).
+const fn ms_to_frames(ms: f32) -> f32 {
+    ms * 0.06
+}
+
+/// game_design.md §5 juice table -> `Vfx` state (shake/flash/particles),
+/// one `BattleEvent` at a time, IN ORDER (SPEC §5 "HARD RULES"). Events with
+/// no juice-table row (`SpecialHit`, `AnchorBreak`, `AirborneLaunch`,
+/// `Landed`) are deliberately silent here — see the M7 report for the full
+/// per-row wiring list, including the two rows with no `BattleEvent` at all
+/// (Wall bounce, Round/Match win) that are driven from sim-state deltas /
+/// screen transitions elsewhere in this file instead.
+fn handle_battle_event(
+    v: &mut Vfx,
+    world: &physics::World,
+    ev: &BattleEvent,
+    presets: [&Preset; 2],
+) {
+    match *ev {
+        BattleEvent::Hit { heavy, pos, .. } => {
+            if heavy {
+                v.shake.add(7.0, 0.86);
+                v.flash.add(particles::WHITE * 0.35, ms_to_frames(60.0));
+                particles::spawn_heavy_hit(&mut v.particles, &mut v.rng, pos);
+            } else {
+                v.shake.add(2.0, 0.80);
+                particles::spawn_light_hit(&mut v.particles, &mut v.rng, pos);
+            }
+        }
+        BattleEvent::Dash { who } => {
+            v.shake.add(1.0, 0.80);
+            let top = &world.tops[who as usize];
+            let back = Vec2::new(-top.vel.x, -top.vel.z).normalize_or_zero();
+            let accent = accent_to_vec3(presets[who as usize].accent);
+            particles::spawn_dash(&mut v.particles, &mut v.rng, top.pos, back, accent);
+        }
+        BattleEvent::AerialSlam { who } => {
+            // game_design.md §5's "Airborne clash" row: the closest sim
+            // event to that moment is a landed aerial slam (Hop's airborne
+            // attack) — see the M7 report for why this mapping was chosen
+            // over a synthetic "both tops airborne" detector.
+            let top = &world.tops[who as usize];
+            v.shake.add(9.0, 0.88);
+            v.flash.add(particles::CYAN * 0.30, ms_to_frames(80.0));
+            particles::spawn_airborne_clash(&mut v.particles, &mut v.rng, top.pos);
+        }
+        BattleEvent::SpecialFire { who } => {
+            let top = &world.tops[who as usize];
+            let accent = accent_to_vec3(presets[who as usize].accent);
+            v.shake.add(6.0, 0.84);
+            v.flash.add(accent * 0.40, ms_to_frames(100.0));
+            particles::spawn_special_fire(&mut v.particles, &mut v.rng, top.pos, accent);
+        }
+        BattleEvent::CrashOut { winner } => {
+            let loser = 1 - winner;
+            let pos = world.tops[loser as usize].pos;
+            let accent = accent_to_vec3(presets[winner as usize].accent);
+            v.shake.add(12.0, 0.90);
+            v.flash.add(particles::WHITE * 0.60, ms_to_frames(120.0));
+            particles::spawn_crash_out(&mut v.particles, &mut v.rng, pos, accent);
+        }
+        BattleEvent::RingOut { who } => {
+            let pos = world.tops[who as usize].pos;
+            v.shake.add(8.0, 0.87);
+            v.flash
+                .add(particles::RED_ORANGE * 0.30, ms_to_frames(90.0));
+            particles::spawn_ring_out(&mut v.particles, &mut v.rng, pos);
+        }
+        BattleEvent::Topple { who } => {
+            let pos = world.tops[who as usize].pos;
+            v.shake.add(5.0, 0.80);
+            v.flash.add(particles::AMBER * 0.25, ms_to_frames(100.0));
+            particles::spawn_topple(&mut v.particles, &mut v.rng, pos);
+        }
+        BattleEvent::Parry { who } | BattleEvent::GuardBlock { who } => {
+            let top = &world.tops[who as usize];
+            v.shake.add(3.0, 0.85);
+            v.flash.add(particles::WHITE * 0.20, ms_to_frames(50.0));
+            let facing = combat::facing_xz(top);
+            particles::spawn_guard_parry(&mut v.particles, &mut v.rng, top.pos, facing);
+        }
+        // No juice-table row: sim-visible bookkeeping events only.
+        BattleEvent::AirborneLaunch { .. }
+        | BattleEvent::Landed { .. }
+        | BattleEvent::SpecialHit { .. }
+        | BattleEvent::AnchorBreak { .. } => {}
+    }
+}
+
+/// Wall bounce (game_design.md §5: "10 dust tangential") has no dedicated
+/// `BattleEvent` — terrain contact (including the wall) is continuous
+/// normal-force projection in `physics.rs`, not a discrete collision moment
+/// (confirmed: `TuneParams::hitstop_wall_bounce` is defined but never read
+/// anywhere in `physics.rs`). Approximated here from SIM STATE alone (SPEC
+/// §5 explicitly allows this): a top on the wall band (`r > WALL_START`)
+/// whose outward-radial velocity flips from clearly-positive (heading into
+/// the wall) to clearly-negative (pushed back) between two consecutive
+/// world snapshots reads as a bounce. Only sees the LAST of this flow
+/// frame's `SIM_STEPS_PER_FLOW_FRAME` sub-steps (the same limitation
+/// `flow.rs` documents for anything reading `world_prev`/`world` directly
+/// instead of the accumulated `frame_events`) — an accepted approximation
+/// for a cosmetic dust puff.
+fn detect_wall_bounces(v: &mut Vfx, prev: &physics::World, curr: &physics::World) {
+    for i in 0..2 {
+        let p = &prev.tops[i];
+        let c = &curr.tops[i];
+        if !c.grounded {
+            continue;
+        }
+        let r = fixmath::sqrt(c.pos.x * c.pos.x + c.pos.z * c.pos.z);
+        if r <= arena::WALL_START {
+            continue;
+        }
+        let radial_dir = Vec2::new(c.pos.x, c.pos.z).normalize_or_zero();
+        let prev_out = p.vel.x * radial_dir.x + p.vel.z * radial_dir.y;
+        let curr_out = c.vel.x * radial_dir.x + c.vel.z * radial_dir.y;
+        if prev_out > 0.5 && curr_out < -0.2 {
+            v.shake.add(4.0, 0.82);
+            // "ring tint .15" (game_design.md §5): the arena ring bands'
+            // own cyan-ish emissive color, at their given low alpha.
+            v.flash.add(particles::CYAN * 0.15, ms_to_frames(80.0));
+            let tangent = Vec2::new(-radial_dir.y, radial_dir.x);
+            particles::spawn_wall_bounce(&mut v.particles, &mut v.rng, c.pos, tangent);
+        }
+    }
+}
+
+/// One flow frame's worth of `Vfx` bookkeeping (Tasks 2/3/4/5), called once
+/// per `flow_state.advance()` — i.e. potentially more than once per
+/// rendered frame if sim time is catching up (mirrors the existing SFX/
+/// music wiring's own cadence in `main`). Returns whether the screen
+/// discriminant changed this call (so `main` can react once, e.g. firing
+/// round/match-win VFX below).
+fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
+    let screen_changed = v.prev_screen != flow_state.screen;
+    v.prev_screen = flow_state.screen;
+    if screen_changed {
+        v.wipe_frame = 0;
+    } else if v.wipe_frame < vfx::WIPE_FRAMES {
+        v.wipe_frame += 1;
+    }
+
+    // Reseed the dedicated render-side RNG once per ROUND (SPEC §5 "HARD
+    // RULES"), never per-frame — a fresh, cheap `ParticlePool` too, so a
+    // brand new round never shows a stray straggler from two rounds ago
+    // (they'd have expired within their own lifetime anyway; this is just
+    // tidy determinism, not a correctness requirement).
+    let round_seed = flow_state.round_seed();
+    if round_seed != v.prev_round_seed {
+        v.rng = Rng::new(round_seed ^ VFX_RNG_SALT);
+        v.prev_round_seed = round_seed;
+        v.particles = ParticlePool::new();
+    }
+
+    let presets = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
+
+    if let Some(world) = &flow_state.world {
+        for ev in &flow_state.frame_events {
+            handle_battle_event(v, world, ev, presets);
+        }
+        if let Some(prev) = &flow_state.world_prev {
+            detect_wall_bounces(v, prev, world);
+        }
+    }
+
+    // Round win / Match win (game_design.md §5): no `BattleEvent` exists for
+    // either — they're screen-transition moments (Decided entry / MatchOver
+    // entry), driven here from the flow's own `last_winner`/`score`.
+    if screen_changed {
+        if matches!(flow_state.screen, Screen::Match(MatchPhase::Decided)) {
+            if let (Some(winner), Some(world)) = (flow_state.last_winner, &flow_state.world) {
+                v.shake.add(4.0, 0.78);
+                v.flash.add(particles::GOLD * 0.30, ms_to_frames(150.0));
+                particles::spawn_round_win(
+                    &mut v.particles,
+                    &mut v.rng,
+                    world.tops[winner as usize].pos,
+                );
+            }
+        }
+        if matches!(flow_state.screen, Screen::MatchOver) {
+            // "6px x2 pulses" (game_design.md §5): two stacked shake
+            // additions (the 14px clamp still applies as one combined cap).
+            v.shake.add(6.0, 0.80);
+            v.shake.add(6.0, 0.80);
+            v.flash.add(particles::GOLD * 0.45, ms_to_frames(250.0));
+            if let Some(world) = &flow_state.world {
+                let winner = if flow_state.score[0] >= MATCH_WIN_POINTS {
+                    0
+                } else {
+                    1
+                };
+                particles::spawn_match_win(
+                    &mut v.particles,
+                    &mut v.rng,
+                    world.tops[winner as usize].pos,
+                );
+            }
+        }
+        if matches!(flow_state.screen, Screen::Match(MatchPhase::Decided)) {
+            v.decided_scale.snap(1.5);
+        }
+        if matches!(flow_state.screen, Screen::MatchOver) {
+            v.matchover_scale.snap(1.5);
+        }
+    }
+    if matches!(flow_state.screen, Screen::Match(MatchPhase::Decided)) {
+        v.decided_scale.step(1.0);
+    }
+    if matches!(flow_state.screen, Screen::MatchOver) {
+        v.matchover_scale.step(1.0);
+    }
+
+    // Intro countdown numeral pop (game_design.md §7): re-snap the overshoot
+    // spring every time the displayed numeral/text actually changes.
+    if matches!(flow_state.screen, Screen::Match(MatchPhase::Intro)) {
+        let banner_text = flow::intro_banner(flow_state.frame);
+        if banner_text != v.prev_intro_banner {
+            v.intro_scale.snap(1.3);
+            v.prev_intro_banner = banner_text;
+        }
+        v.intro_scale.step(1.0);
+    }
+
+    // RoundResult pip tally count (game_design.md §7 "main.rs edge"): just
+    // the pure state update here; `main`'s loop captures `prev_tally`
+    // before this call and compares after, so it can fire exactly one
+    // `Sfx::ScoreTally` per newly-landed pip without this function needing
+    // a `&mut Mixer` threaded through it.
+    if matches!(flow_state.screen, Screen::Match(MatchPhase::RoundResult))
+        && flow_state.last_winner.is_some()
+    {
+        v.prev_tally = hud::tally_pip_count(flow_state.frame, flow_state.last_points);
+    } else {
+        v.prev_tally = 0;
+    }
+
+    // Menu cursor springs (game_design.md §7: "~120 ms spring settle"),
+    // eased every flow frame regardless of screen (cheap, and avoids a
+    // stale spring position if the player left and returns to a screen).
+    v.menu_spring.ease_toward(flow_state.menu_cursor as f32);
+    v.select_spring.ease_toward(flow_state.select_cursor as f32);
+    v.settings_spring
+        .ease_toward(flow_state.settings_cursor as f32);
+
+    v.particles.update();
+    v.shake.step();
+    v.flash.step();
+
+    screen_changed
+}
+
 /// Draw the whole game for the current flow state. Pure function of
-/// `(flow_state, alpha)` — all blink phases come from flow's frame counters.
-fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha: f32) {
+/// `(flow_state, alpha, vfxs)` — all blink/animation phases come from flow's
+/// or `vfxs`'s own frame counters, never wall-clock (SPEC §5).
+#[allow(clippy::too_many_arguments)]
+fn render(
+    frame: &mut Frame,
+    flow_state: &FlowState,
+    scene: &BattleScene,
+    alpha: f32,
+    vfxs: &mut Vfx,
+) {
+    vfxs.post.begin_frame();
+
+    let shake_mult = vfx::shake_level_mult(flow_state.settings.shake);
+    let shake_offset = vfxs.shake.offset(&mut vfxs.rng, shake_mult);
+    let flash_color = vfxs.flash.current();
+    let colorblind = flow_state.settings.colorblind;
+
     match flow_state.screen {
         Screen::Boot => {
             frame.clear(hud::COL_BG);
@@ -83,7 +421,12 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
         }
         Screen::MainMenu => {
             frame.clear(hud::COL_BG);
-            hud::draw_main_menu(frame, flow_state.menu_cursor, flow_state.frame);
+            hud::draw_main_menu(
+                frame,
+                flow_state.menu_cursor,
+                vfxs.menu_spring.value,
+                flow_state.frame,
+            );
         }
         Screen::Garage => {
             frame.clear(hud::COL_BG);
@@ -91,11 +434,21 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
         }
         Screen::Settings => {
             frame.clear(hud::COL_BG);
-            hud::draw_settings(frame, &flow_state.settings, flow_state.settings_cursor);
+            hud::draw_settings(
+                frame,
+                &flow_state.settings,
+                flow_state.settings_cursor,
+                vfxs.settings_spring.value,
+            );
         }
         Screen::TopSelect => {
             frame.clear(hud::COL_BG);
-            hud::draw_top_select(frame, flow_state.select_cursor, flow_state.frame);
+            hud::draw_top_select(
+                frame,
+                flow_state.select_cursor,
+                vfxs.select_spring.value,
+                flow_state.frame,
+            );
         }
         Screen::Match(phase) => {
             let visuals = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
@@ -103,20 +456,49 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
 
             // 3D backdrop: the live sim during Fight/Decided, the cosmetic
             // launch preview during Intro/Launch (SPEC §5: interpolate the
-            // two most recent sim states by alpha).
+            // two most recent sim states by alpha) — now through the M7
+            // bloom/particle/shake/ring-pulse pipeline.
             match (&flow_state.world_prev, &flow_state.world) {
-                (Some(prev), Some(curr)) => scene.draw(frame, prev, curr, alpha, visuals),
-                (None, Some(curr)) => scene.draw(frame, curr, curr, 1.0, visuals),
-                _ => frame.clear(hud::COL_BG),
+                (Some(prev), Some(curr)) => scene.draw_ex(
+                    frame,
+                    &mut vfxs.post,
+                    prev,
+                    curr,
+                    alpha,
+                    visuals,
+                    vfxs.ring_pulse,
+                    shake_offset,
+                    &vfxs.particles,
+                ),
+                (None, Some(curr)) => scene.draw_ex(
+                    frame,
+                    &mut vfxs.post,
+                    curr,
+                    curr,
+                    1.0,
+                    visuals,
+                    vfxs.ring_pulse,
+                    shake_offset,
+                    &vfxs.particles,
+                ),
+                _ => {
+                    frame.clear(hud::COL_BG);
+                    vfxs.post.begin_frame();
+                }
             }
 
             match phase {
                 MatchPhase::Intro => {
-                    hud::draw_score_pips(frame, flow_state.score, accents);
-                    hud::draw_banner(frame, flow::intro_banner(flow_state.frame), 7, hud::COL_ICE);
+                    hud::draw_score_pips(frame, flow_state.score, accents, colorblind);
+                    hud::draw_banner_scaled(
+                        frame,
+                        flow::intro_banner(flow_state.frame),
+                        7.0 * vfxs.intro_scale.value,
+                        hud::COL_ICE,
+                    );
                 }
                 MatchPhase::Launch => {
-                    hud::draw_score_pips(frame, flow_state.score, accents);
+                    hud::draw_score_pips(frame, flow_state.score, accents, colorblind);
                     let opp_dir = flow_state
                         .ai_choice
                         .map(|c| c.spin_dir)
@@ -131,6 +513,7 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
                             visuals,
                             flow_state.score,
                             flow_state.frame,
+                            colorblind,
                         );
                     }
                 }
@@ -142,13 +525,14 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
                             visuals,
                             flow_state.score,
                             flow_state.frame,
+                            colorblind,
                         );
                     }
                     if let Some(outcome) = flow_state.last_outcome {
-                        hud::draw_banner(
+                        hud::draw_banner_scaled(
                             frame,
                             flow::outcome_banner(outcome, flow_state.last_round_end),
-                            6,
+                            6.0 * vfxs.decided_scale.value,
                             hud::COL_ICE,
                         );
                     }
@@ -165,19 +549,56 @@ fn render(frame: &mut Frame, flow_state: &FlowState, scene: &BattleScene, alpha:
                         accents,
                         line,
                         flow_state.frame,
+                        flow_state.last_winner,
+                        flow_state.last_points,
+                        colorblind,
                     );
                 }
             }
         }
         Screen::MatchOver => {
-            frame.clear(hud::COL_BG);
+            let visuals = [&PRESETS[flow_state.p1_pick], &PRESETS[flow_state.ai_pick]];
+            match (&flow_state.world_prev, &flow_state.world) {
+                (Some(prev), Some(curr)) => scene.draw_ex(
+                    frame,
+                    &mut vfxs.post,
+                    prev,
+                    curr,
+                    alpha,
+                    visuals,
+                    vfxs.ring_pulse,
+                    shake_offset,
+                    &vfxs.particles,
+                ),
+                (None, Some(curr)) => scene.draw_ex(
+                    frame,
+                    &mut vfxs.post,
+                    curr,
+                    curr,
+                    1.0,
+                    visuals,
+                    vfxs.ring_pulse,
+                    shake_offset,
+                    &vfxs.particles,
+                ),
+                _ => {
+                    frame.clear(hud::COL_BG);
+                    vfxs.post.begin_frame();
+                }
+            }
             hud::draw_match_over(
                 frame,
                 flow_state.score[0] >= MATCH_WIN_POINTS,
                 flow_state.score,
                 flow_state.frame,
+                6.0 * vfxs.matchover_scale.value,
             );
         }
+    }
+
+    vfxs.post.composite(frame, flash_color);
+    if vfxs.wipe_frame < vfx::WIPE_FRAMES {
+        vfx::draw_wipe(frame, vfxs.wipe_frame);
     }
 }
 
@@ -257,6 +678,7 @@ fn main() {
     platform.audio_init();
     let scene = BattleScene::new();
     let mut frame = Frame::new(W, H);
+    let mut vfxs = Vfx::new();
 
     // Fixed base seed: the flow folds menu timing (total frames until the
     // player confirms a top) into each match seed, so matches still vary
@@ -297,6 +719,7 @@ fn main() {
         pending_steps += clock.advance(dt, 8);
         while pending_steps >= flow::SIM_STEPS_PER_FLOW_FRAME {
             let prev_nav = MenuNavSnapshot::of(&flow_state);
+            let prev_tally = vfxs.prev_tally;
 
             flow_state.advance(input, esc);
             pending_steps -= flow::SIM_STEPS_PER_FLOW_FRAME;
@@ -348,6 +771,12 @@ fn main() {
             if let Some(sfx) = menu_sfx_for(prev_nav, MenuNavSnapshot::of(&flow_state)) {
                 play(&mut mixer, sfx);
             }
+
+            // ---- M7 VFX: shake/flash/particles/springs/wipe/pip-tally.
+            advance_vfx_for_flow_frame(&mut vfxs, &flow_state);
+            if vfxs.prev_tally > prev_tally {
+                play(&mut mixer, Sfx::ScoreTally);
+            }
         }
         // Esc semantics (quit on Title/MainMenu, back/abort elsewhere) are
         // decided entirely inside flow::advance.
@@ -370,19 +799,30 @@ fn main() {
         // accurate regardless of render-frame jitter or how many ring slots
         // happened to free up; `Platform::audio_submit` duplicates mono to
         // interleaved stereo (SPEC §8) and is a no-op with no audio device.
+        //
+        // ---- Task 4 ring pulse: driven off `Tracker::row_index()` (never
+        // audio output — SPEC §5), an EDGE onto a kick row, checked once per
+        // row actually fired (a row can span more than one audio buffer at
+        // low BPM, so re-checking per buffer would re-trigger the same kick
+        // repeatedly instead of decaying between rows).
         let free_buffers = platform.audio_free_buffers();
         let mut mono = [0i16; AUDIO_BUFFER_FRAMES];
         for _ in 0..free_buffers {
             tracker.advance(&mut mixer, AUDIO_BUFFER_FRAMES as u32);
             mixer.render(&mut mono);
             platform.audio_submit(&mono);
+
+            let row = tracker.row_index();
+            let kicked = row != vfxs.prev_tracker_row && tracker.kick_on_current_row();
+            vfxs.prev_tracker_row = row;
+            vfxs.ring_pulse = vfx::ring_pulse_step(vfxs.ring_pulse, kicked);
         }
 
         // Render interpolation factor: fraction of the way from the previous
         // sim state to the current one. A leftover banked step means we're
         // already a full step past `world` — clamp to 1 (never extrapolate).
         let alpha = (pending_steps as f32 + clock.alpha()).min(1.0);
-        render(&mut frame, &flow_state, &scene, alpha);
+        render(&mut frame, &flow_state, &scene, alpha, &mut vfxs);
         platform.blit(&frame.px, W as i32, H as i32);
 
         // Pace to 60 fps: sleep off the coarse remainder, leaving a small

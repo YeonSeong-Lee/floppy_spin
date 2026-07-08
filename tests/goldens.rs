@@ -16,6 +16,8 @@ use floppy_core::roster::{Preset, Silhouette, PRESETS};
 use floppy_core::vec::{Vec2, Vec3};
 use floppy_render::battle::BattleScene;
 use floppy_render::frame::Frame;
+use floppy_render::particles::ParticlePool;
+use floppy_render::post::PostState;
 use std::path::PathBuf;
 
 const WIDTH: usize = 960;
@@ -168,12 +170,31 @@ fn staged_golden_renders_match_checked_in_pngs() {
     let scene = BattleScene::new();
     let visuals = staged_visuals();
     let dir = PathBuf::from("goldens");
+    let empty_particles = ParticlePool::new();
 
     let mut failures = Vec::new();
 
     for (name, world) in GOLDEN_NAMES.iter().zip(staged_goldens()) {
         let mut frame = Frame::new(WIDTH, HEIGHT);
-        scene.draw(&mut frame, &world, &world, 1.0, visuals);
+        // M7: routed through the bloom/dither/scanline/vignette post
+        // pipeline (see `src/bin/headless.rs`'s `render_staged` docs for why
+        // — this MUST stay byte-for-byte the same call shape, since both
+        // sites are compared against the exact same checked-in PNGs).
+        // `ring_pulse = 0.0` / `shake = (0.0, 0.0)` / no particles / no
+        // flash: the documented OFF/zero state for goldens.
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        scene.draw_ex(
+            &mut frame,
+            &mut post,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &empty_particles,
+        );
+        post.composite(&mut frame, Vec3::default());
 
         let path = dir.join(name);
         let bytes = match std::fs::read(&path) {

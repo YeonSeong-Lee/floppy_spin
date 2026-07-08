@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use floppy_core::arena;
 use floppy_core::combat::{CombatState, SpecialId};
 use floppy_core::input::InputState;
-use floppy_core::physics::{LaunchParams, Stats, Top, World, TUNE};
+use floppy_core::physics::{BattleEvent, LaunchParams, Stats, Top, World, TUNE};
 use floppy_core::rng::Rng;
 use floppy_core::roster::{Preset, Silhouette, PRESETS};
 use floppy_core::vec::{Vec2, Vec3};
 use floppy_render::battle::BattleScene;
+use floppy_render::particles::{self, ParticlePool};
+use floppy_render::post::PostState;
 
 const WIDTH: usize = 960;
 const HEIGHT: usize = 540;
@@ -314,12 +316,34 @@ fn staged_visuals() -> [&'static Preset; 2] {
 }
 
 /// Render the 3 staged goldens (alpha = 1.0) into raw `0x00RRGGBB` pixel
-/// buffers, in [`GOLDEN_NAMES`] order.
+/// buffers, in [`GOLDEN_NAMES`] order. M7: routed through the FULL
+/// bloom/dither/scanline/vignette post pipeline (`BattleScene::draw_ex` +
+/// `PostState::composite`) so the checked-in goldens actually exercise it —
+/// but with every EVENT-DRIVEN effect at its documented OFF/zero state:
+/// `ring_pulse = 0.0` (headless has no `Tracker` in this path — see the
+/// `--scene battle` docs below for the same call), `shake = (0.0, 0.0)`, an
+/// empty `ParticlePool`, and no flash (`Vec3::default()`). This keeps the
+/// goldens a pure function of the staged `World`s (deterministic, no RNG
+/// consumed) while still catching regressions in bloom/dither/scanline/
+/// vignette themselves.
 fn render_staged(scene: &BattleScene) -> [Vec<u32>; 3] {
     let visuals = staged_visuals();
+    let empty_particles = ParticlePool::new();
     staged_goldens().map(|world| {
         let mut frame = floppy_render::frame::Frame::new(WIDTH, HEIGHT);
-        scene.draw(&mut frame, &world, &world, 1.0, visuals);
+        let mut post = PostState::new(WIDTH, HEIGHT);
+        scene.draw_ex(
+            &mut frame,
+            &mut post,
+            &world,
+            &world,
+            1.0,
+            visuals,
+            0.0,
+            (0.0, 0.0),
+            &empty_particles,
+        );
+        post.composite(&mut frame, Vec3::default());
         frame.px
     })
 }
@@ -514,18 +538,44 @@ fn main() {
     // scene's mesh construction on the gradient/test3d paths).
     let mut battle_world: Option<World> = None;
     let mut battle_scene: Option<BattleScene> = None;
+    // M7: the real bloom/particle pipeline, exercised for perf realism (see
+    // `print_perf_summary`'s docs) — NOT wired to the full main.rs juice
+    // table (that lives in `src/main.rs`'s `Vfx`/`handle_battle_event`); a
+    // headless perf/video path has no flow/screen-transition state to hang
+    // Round-win/Match-win/etc. off of, and the SPEC §10 budget line this
+    // exists to measure ("Particles/trails/bloom") is dominated by
+    // per-particle draw cost, not which juice-table row spawned them — so
+    // only `Hit` (the highest-frequency event in a real fight) is wired
+    // here, giving a representative particle load without duplicating
+    // main.rs's whole event-to-VFX table.
+    let mut post_state: Option<PostState> = None;
+    let mut particle_pool: Option<ParticlePool> = None;
+    let mut particle_rng = Rng::new(0x00F7_0000_0000_002A);
+    // `ring_pulse`/`shake` are the documented deterministic-zero/constant
+    // fallback (module docs on `render_staged` above): headless has no
+    // `Tracker` in this video path, so there is no row index to derive a
+    // pulse from cheaply, and no persistent shake-decay state worth
+    // threading through a throwaway perf/golden harness.
+    const NO_SHAKE: (f32, f32) = (0.0, 0.0);
     if matches!(scene, SceneKind::Battle) {
         battle_world = Some(build_battle_world());
         battle_scene = Some(BattleScene::new());
+        post_state = Some(PostState::new(WIDTH, HEIGHT));
+        particle_pool = Some(ParticlePool::new());
     }
 
     // Coarse wall-clock perf sanity (task spec §5 "perf sanity"): timed here
-    // in `main`, around the call sites only — never inside `World::step` or
-    // `BattleScene::draw` themselves, so no wall-clock ever enters the
-    // deterministic sim/render path. Battle-scene only; reported once at
-    // the end, not fed back into anything.
+    // in `main`, around the call sites only — never inside `World::step`,
+    // `BattleScene::draw_ex`, or `PostState::composite` themselves, so no
+    // wall-clock ever enters the deterministic sim/render path. Battle-scene
+    // only; reported once at the end, not fed back into anything. `draw_ms`
+    // is the scene+particle raster pass (SPEC §10's "Arena + tops raster" +
+    // half of "Particles/trails/bloom"); `post_ms` is the OTHER half (the
+    // bloom blur/composite pass) — split out so a budget overrun is
+    // attributable to the right SPEC §10 line.
     let mut sim_ms: Vec<f64> = Vec::new();
     let mut draw_ms: Vec<f64> = Vec::new();
+    let mut post_ms: Vec<f64> = Vec::new();
 
     for t in 0..frames {
         let framebuffer: &[u32] = match scene {
@@ -547,21 +597,51 @@ fn main() {
             SceneKind::Battle => {
                 let world = battle_world.as_mut().expect("battle_world initialized");
                 let scene_ref = battle_scene.as_ref().expect("battle_scene initialized");
+                let post = post_state.as_mut().expect("post_state initialized");
+                let particles = particle_pool.as_mut().expect("particle_pool initialized");
                 // 2 sim steps per rendered frame (task spec), scripted
-                // inputs as a pure function of the frame index.
+                // inputs as a pure function of the frame index. Events
+                // drained after EACH step (not just the pair), matching
+                // `render_wav_frames`'s own pattern below — `World::step`
+                // clears `events` at the top of every call.
                 let inputs = battle_scripted_inputs(t);
                 let sim_start = std::time::Instant::now();
-                world.step(inputs);
-                world.step(inputs);
+                for _ in 0..2 {
+                    world.step(inputs);
+                    for ev in &world.events {
+                        if let BattleEvent::Hit { heavy, pos, .. } = *ev {
+                            if heavy {
+                                particles::spawn_heavy_hit(particles, &mut particle_rng, pos);
+                            } else {
+                                particles::spawn_light_hit(particles, &mut particle_rng, pos);
+                            }
+                        }
+                    }
+                }
                 sim_ms.push(sim_start.elapsed().as_secs_f64() * 1000.0);
+                particles.update();
 
                 let visuals = [
                     preset_by_silhouette(Silhouette::Keystone),
                     preset_by_silhouette(Silhouette::Keystone),
                 ];
                 let draw_start = std::time::Instant::now();
-                scene_ref.draw(&mut frame3d, world, world, 1.0, visuals);
+                scene_ref.draw_ex(
+                    &mut frame3d,
+                    post,
+                    world,
+                    world,
+                    1.0,
+                    visuals,
+                    0.0,
+                    NO_SHAKE,
+                    particles,
+                );
                 draw_ms.push(draw_start.elapsed().as_secs_f64() * 1000.0);
+
+                let post_start = std::time::Instant::now();
+                post.composite(&mut frame3d, Vec3::default());
+                post_ms.push(post_start.elapsed().as_secs_f64() * 1000.0);
                 &frame3d.px
             }
         };
@@ -578,7 +658,7 @@ fn main() {
     }
 
     if matches!(scene, SceneKind::Battle) && !sim_ms.is_empty() {
-        print_perf_summary(&sim_ms, &draw_ms);
+        print_perf_summary(&sim_ms, &draw_ms, &post_ms);
     }
 }
 
@@ -590,15 +670,17 @@ fn max(v: &[f64]) -> f64 {
     v.iter().copied().fold(f64::MIN, f64::max)
 }
 
-fn print_perf_summary(sim_ms: &[f64], draw_ms: &[f64]) {
+fn print_perf_summary(sim_ms: &[f64], draw_ms: &[f64], post_ms: &[f64]) {
     let sim_mean = mean(sim_ms);
     let sim_max = max(sim_ms);
     let draw_mean = mean(draw_ms);
     let draw_max = max(draw_ms);
-    let total_mean = sim_mean + draw_mean;
-    let total_max = sim_max + draw_max;
+    let post_mean = mean(post_ms);
+    let post_max = max(post_ms);
+    let total_mean = sim_mean + draw_mean + post_mean;
+    let total_max = sim_max + draw_max + post_max;
     println!(
-        "perf: sim mean={sim_mean:.3}ms max={sim_max:.3}ms | draw mean={draw_mean:.3}ms max={draw_max:.3}ms | total mean={total_mean:.3}ms max={total_max:.3}ms (budget: 10ms/frame release, SPEC §10)"
+        "perf: sim mean={sim_mean:.3}ms max={sim_max:.3}ms | draw(scene+particles) mean={draw_mean:.3}ms max={draw_max:.3}ms | post(bloom composite) mean={post_mean:.3}ms max={post_max:.3}ms | total mean={total_mean:.3}ms max={total_max:.3}ms (budget: 10ms/frame release, SPEC §10)"
     );
     if total_mean > 10.0 {
         println!("PERF WARNING: mean total frame time {total_mean:.3}ms exceeds the 10ms budget!");

@@ -16,7 +16,10 @@ use crate::camera::Camera;
 use crate::clip;
 use crate::frame::Frame;
 use crate::mesh::{self, Mesh};
-use crate::raster::{self, draw_tri, draw_tri_additive, SVert};
+use crate::post::BrightBuffer;
+use crate::raster::{
+    self, draw_tri, draw_tri_additive, draw_tri_additive_bloom, draw_tri_bloom, SVert,
+};
 use crate::shade::{self, Material};
 use floppy_core::fixmath;
 use floppy_core::vec::{Vec2, Vec3};
@@ -186,6 +189,158 @@ fn draw_instance_impl<'a>(
             }
         }
     }
+}
+
+/// Does this material contribute to bloom (game_design.md §6: "emissive-
+/// tagged pixels always bloom")? A material bloomas iff it has ANY nonzero
+/// emissive component — the dark-metal top body / arena materials are
+/// exactly `emissive = (0,0,0)` and never bloom; the accent flange / neon
+/// ring materials are always nonzero.
+fn is_emissive(m: &Material) -> bool {
+    m.emissive.length_sq() > 0.0
+}
+
+/// Bloom-aware, shake-aware sibling of [`draw_instance`] (M7 Task 1/3):
+/// tags emissive triangles into `bright` (see `raster.rs`'s
+/// `draw_tri_bloom` docs) and offsets every projected screen coordinate by
+/// `shake` (whole pixels — game_design.md §5 shake, applied here so the
+/// WHOLE 3D scene shakes together; HUD is drawn separately, unshifted, by
+/// `main.rs`/`hud.rs`). A separate code path from `draw_instance_impl`
+/// (rather than threading an `Option<&mut BrightBuffer>` through the shared
+/// one) — `battle.rs`'s bloom pipeline always has a live `BrightBuffer`, so
+/// there's no "sometimes None" case to thread, and keeping the two loops
+/// textually separate sidesteps a double-mutable-reference reborrow dance
+/// for a few lines' worth of near-duplication.
+#[allow(clippy::too_many_arguments)]
+fn draw_instance_impl_bloom<'a>(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    cam: &Camera,
+    inst: &Instance,
+    material_for: impl Fn(usize) -> &'a Material,
+    additive: bool,
+    shake: (f32, f32),
+) {
+    for tri in &inst.mesh.tris {
+        let mut world = [Vec3::default(); 3];
+        let mut col = [Vec3::default(); 3];
+        let mut emissive = false;
+
+        for i in 0..3 {
+            let idx = tri[i] as usize;
+            let m = material_for(idx);
+            emissive = emissive || is_emissive(m);
+            let local = scale_pos(inst.mesh.verts[idx], inst.radial_scale, inst.height_scale);
+            let local_n = scale_normal(inst.mesh.norms[idx], inst.radial_scale, inst.height_scale);
+            let w = rotate(local, inst.yaw, inst.tilt) + inst.offset;
+            let wn = rotate(local_n, inst.yaw, inst.tilt);
+            let view_dir = (cam.pos - w).normalize_or_zero();
+            world[i] = w;
+            col[i] = shade::shade(wn, view_dir, m);
+        }
+
+        let view_tri = [
+            (cam.to_view(world[0]), col[0]),
+            (cam.to_view(world[1]), col[1]),
+            (cam.to_view(world[2]), col[2]),
+        ];
+
+        let (clipped, count) = clip::clip_near(view_tri, Camera::NEAR);
+        for t in clipped.iter().take(count as usize) {
+            let t = *t;
+            let (x0, y0, z0) = cam.project(t[0].0);
+            let (x1, y1, z1) = cam.project(t[1].0);
+            let (x2, y2, z2) = cam.project(t[2].0);
+
+            if raster::signed_area(x0, y0, x1, y1, x2, y2) <= 0.0 {
+                continue;
+            }
+
+            let sv = |x: f32, y: f32, inv_z: f32, c: Vec3| SVert {
+                x: x + shake.0,
+                y: y + shake.1,
+                inv_z,
+                r: c.x,
+                g: c.y,
+                b: c.z,
+            };
+            let va = sv(x0, y0, z0, t[0].1);
+            let vb = sv(x1, y1, z1, t[1].1);
+            let vc = sv(x2, y2, z2, t[2].1);
+            if additive {
+                draw_tri_additive_bloom(frame, bright, va, vb, vc, emissive);
+            } else {
+                draw_tri_bloom(frame, bright, va, vb, vc, emissive);
+            }
+        }
+    }
+}
+
+/// Bloom/shake-aware sibling of [`draw_instance`] (see
+/// `draw_instance_impl_bloom`'s docs).
+pub fn draw_instance_bloom(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    cam: &Camera,
+    inst: &Instance,
+    shake: (f32, f32),
+) {
+    draw_instance_impl_bloom(
+        frame,
+        bright,
+        cam,
+        inst,
+        |_local_idx| &inst.material,
+        false,
+        shake,
+    );
+}
+
+/// Bloom/shake-aware sibling of [`draw_instance_additive`].
+pub fn draw_instance_additive_bloom(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    cam: &Camera,
+    inst: &Instance,
+    shake: (f32, f32),
+) {
+    draw_instance_impl_bloom(
+        frame,
+        bright,
+        cam,
+        inst,
+        |_local_idx| &inst.material,
+        true,
+        shake,
+    );
+}
+
+/// Bloom/shake-aware sibling of [`draw_instance_split`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_instance_split_bloom(
+    frame: &mut Frame,
+    bright: &mut BrightBuffer,
+    cam: &Camera,
+    inst: &Instance,
+    alt_material: &Material,
+    is_alt: impl Fn(usize) -> bool,
+    shake: (f32, f32),
+) {
+    draw_instance_impl_bloom(
+        frame,
+        bright,
+        cam,
+        inst,
+        |local_idx| {
+            if is_alt(local_idx) {
+                alt_material
+            } else {
+                &inst.material
+            }
+        },
+        false,
+        shake,
+    );
 }
 
 /// The M3-A demo scene / determinism-test target (SPEC §10 perf smoke also
