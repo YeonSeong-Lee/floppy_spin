@@ -1,2 +1,4 @@
 /target
 /out
+# Coding-agent scratch state, not project state.
+/.omc
