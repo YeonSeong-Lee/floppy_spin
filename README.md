@@ -54,9 +54,10 @@ The shipping binary lands at `target/release/floppy_spin.exe` (also
 buildable explicitly at `target/x86_64-pc-windows-gnu/release/floppy_spin.exe`
 depending on how the default target resolves). The release profile
 (`opt-level="z"`, `lto=true`, `codegen-units=1`, `panic="abort"`,
-`strip=true`) is what keeps it small. As of this milestone (M9, ship gate)
-the built exe is **391,168 bytes**, about 73% under the 1,474,560-byte
-budget.
+`strip=true`) is what keeps it small. Last measured by CI on a clean
+checkout: **391,680 bytes**, leaving 1,082,880 bytes of margin — about 73%
+under the 1,474,560-byte budget. (The exact figure moves a little with the
+toolchain version; the `gate` bin prints it on every run.)
 
 Do not build this target with the `msvc` toolchain — it uses a different
 CRT/ABI and will drag in `vcruntime` unless statically linked, which this
@@ -132,8 +133,10 @@ Three binaries plus the test suite gate every change:
    `-- --golden write` to regenerate the checked-in PNGs after an
    intentional visual change. The same binary also writes golden WAV audio
    (`-- --wav out.wav --frames N`) for headless audio verification.
-3. **`cargo test --workspace --release`** — 319 tests across every crate
-   covering math properties, physics invariants (collision symmetry,
+3. **`cargo test --workspace --release`** — 312 tests on Windows, 319 on
+   macOS (each platform compiles only its own backend, and the macOS one
+   carries 7 unit tests of its own), covering math properties, physics
+   invariants (collision symmetry,
    grounded stability, ring-out, topple), flow reachability, combat verb
    unit tests, frame-hash determinism, AI balance (Hard beats Easy in >70%
    of a seed spread; Ace never self-rings-out), save-corruption fallback,
