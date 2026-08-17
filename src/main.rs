@@ -20,7 +20,7 @@ use floppy_render::frame::Frame;
 use floppy_render::particles::{self, ParticlePool};
 use floppy_render::post::PostState;
 use floppy_render::{hud, vfx};
-use platform::win32::{self, Platform, WindowScaleMode, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
+use platform::backend::{self, Platform, WindowScaleMode, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
 const H: usize = 540;
@@ -30,7 +30,8 @@ const FRAME_DT: f64 = 1.0 / 60.0;
 const SPIN_MARGIN_S: f64 = 0.0015;
 
 // Virtual-key codes used by the game (plain u8 values, no FFI — the actual
-// key polling lives behind platform::win32).
+// key polling lives behind platform::backend). Windows VK codes are the
+// shared vocabulary: the macOS backend translates winit keys into them.
 const VK_LEFT: u8 = 0x25;
 const VK_UP: u8 = 0x26;
 const VK_RIGHT: u8 = 0x27;
@@ -634,7 +635,7 @@ fn render(
 // ---------------------------------------------------------------------------
 
 /// `flow::WindowScale` (SPEC §7 setting, persisted) -> the platform layer's
-/// own `WindowScaleMode` (kept a distinct type so `win32` doesn't depend on
+/// own `WindowScaleMode` (kept a distinct type so no backend depends on
 /// `floppy_core::flow` — module docs on `WindowScaleMode`).
 fn window_scale_mode_for(scale: flow::WindowScale) -> WindowScaleMode {
     match scale {
@@ -730,7 +731,7 @@ fn main() {
     // (including empty) into `SaveState::default()` — so this line alone
     // covers "no save file yet" and "corrupt save file" identically, with
     // no branching needed here.
-    flow_state.apply_save(save::decode(&win32::save_load()));
+    flow_state.apply_save(save::decode(&backend::save_load()));
 
     // ---- Window-scale (SPEC §7): apply the now-loaded setting once at
     // boot, so a persisted non-default scale takes effect immediately
@@ -791,7 +792,7 @@ fn main() {
                 && matches!(prev_nav.screen, Screen::Garage | Screen::Settings)
             {
                 let (parts, settings) = flow_state.save_snapshot();
-                win32::save_store(&save::encode(parts, &settings));
+                backend::save_store(&save::encode(parts, &settings));
             }
 
             // ---- Window-scale (SPEC §7): re-apply on the same "leaving
@@ -866,7 +867,7 @@ fn main() {
             // player tweaked Settings then immediately quit from MainMenu
             // without a further screen transition) are never silently lost.
             let (parts, settings) = flow_state.save_snapshot();
-            win32::save_store(&save::encode(parts, &settings));
+            backend::save_store(&save::encode(parts, &settings));
             break;
         }
 

@@ -19,9 +19,25 @@ verifier review at the boundary. Cross-cutting invariants re-checked at EVERY mi
 | **M8** | Garage: 20 parts with signed deltas → plain Top resolve, garage screen with live preview, MY BEY in top-select, %APPDATA% save (version + validation fallback) | save corruption tests (missing/truncated/corrupt/wrong version → defaults); parts resolve test (no sim special-casing) |
 | **M9** | Ship gate: size squeeze if needed, full golden set (title/launch/mid-fight/airborne-clash/ring-out/result), clippy/fmt clean, all invariants re-run, README, real-hardware checklist (input feel, waveOut, blit pacing) | every §12 SPEC gate green on a clean checkout |
 
-Deferred / stretch (explicitly out of scope until M9 passes): macOS backend
-(compile-only, untestable here), XInput pad support via runtime `LoadLibraryW`,
-replay export.
+Deferred / stretch (explicitly out of scope until M9 passes): ~~macOS backend~~
+(**done 2026-08-17** — `src/platform/macos.rs`, winit/softbuffer/cpal, safe Rust;
+it turned out to be testable after all, just not from Windows), XInput pad support
+via runtime `LoadLibraryW`, replay export.
+
+## Post-M9 status
+
+M0–M9 are code-complete and every automated gate was green on a clean checkout at
+`122e4bb`. Two things are still open:
+
+1. **SPEC §12.5 real-hardware Windows checks** — `docs/real-hardware-checklist.md`
+   is entirely unticked. This is the last M9 exit-gate item and it cannot be run
+   anywhere but Windows.
+2. **The clean-checkout ship gate is re-armed.** The macOS backend touched
+   `main.rs`, `Cargo.toml`, and `src/platform/`, and per
+   `docs/notes/ship-gate-clean-checkout.md` that resets the clock: the gate that
+   counts is the one run on Windows on the latest commit. The macOS run
+   (319 tests, goldens at diff 0.000, clippy/fmt clean) is evidence, not a
+   substitute — it cannot measure the exe's size or its import table.
 
 ## Working method
 

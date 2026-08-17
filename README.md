@@ -62,6 +62,29 @@ Do not build this target with the `msvc` toolchain — it uses a different
 CRT/ABI and will drag in `vcruntime` unless statically linked, which this
 project does not do.
 
+### Developing on macOS
+
+The game also builds and runs on macOS through a cfg-gated dev backend
+(`src/platform/macos.rs`, safe Rust over `winit`/`softbuffer`/`cpal`). This
+is a development convenience, **not** a shipping target and **not** a ship
+gate — `floppy_spin.exe` remains the only artifact any §12 gate judges.
+
+Because `rust-toolchain.toml` pins a Windows *host* toolchain, bare `cargo`
+fails here with `target tuple in channel name`. Select the host toolchain
+explicitly instead:
+
+```
+RUSTUP_TOOLCHAIN=stable cargo run --release
+RUSTUP_TOOLCHAIN=stable cargo test --workspace --release
+```
+
+The macOS-only dependencies live under
+`[target.'cfg(target_os = "macos")'.dependencies]`, so they never enter the
+Windows build graph, the import allowlist, or the size budget — a Windows
+build still resolves to the four path crates and needs no extra installs.
+The two backends expose an identical API and `main.rs` is not cfg-split, so
+compiling here exercises the same `main.rs` lines Windows compiles.
+
 ## Running and controls
 
 Launch `floppy_spin.exe` directly (double-click, or run it from a shell).
@@ -109,7 +132,7 @@ Three binaries plus the test suite gate every change:
    `-- --golden write` to regenerate the checked-in PNGs after an
    intentional visual change. The same binary also writes golden WAV audio
    (`-- --wav out.wav --frames N`) for headless audio verification.
-3. **`cargo test --workspace --release`** — 312 tests across every crate
+3. **`cargo test --workspace --release`** — 319 tests across every crate
    covering math properties, physics invariants (collision symmetry,
    grounded stability, ring-out, topple), flow reachability, combat verb
    unit tests, frame-hash determinism, AI balance (Hard beats Easy in >70%
@@ -119,6 +142,26 @@ Three binaries plus the test suite gate every change:
 
 `cargo clippy --workspace --release --all-targets` and `cargo fmt --check`
 must both be clean; both are part of the ship gate.
+
+### What runs where
+
+Gates 2, 3, clippy, and fmt are platform-independent and run on macOS too
+(prefix them with `RUSTUP_TOOLCHAIN=stable`). Gate 1 compiles anywhere but
+only means anything against a Windows PE, and SPEC §12.5's real-hardware
+checks are Windows-only by definition. Measured on `aarch64-apple-darwin`
+2026-08-17: 319 tests pass and all six goldens compare at mean-abs-diff
+**0.000** — not merely inside the tolerance rule but byte-identical to PNGs
+generated on Windows/x86_64, which is the determinism claim above holding
+across two architectures rather than just across two runs.
+
+Never run `--golden write` anywhere but Windows: the checked-in PNGs are the
+ship reference, and regenerating them elsewhere would silently redefine what
+"correct" means.
+
+Because gates 1 and 5 are Windows-only, **any change touching `main.rs`,
+`Cargo.toml`, or `src/platform/` re-arms the clean-checkout ship gate**
+(`docs/notes/ship-gate-clean-checkout.md`) — a green macOS run does not
+retire it.
 
 ## Architecture
 
@@ -134,9 +177,17 @@ floppy_spin/
     ├── bin/headless.rs bin `headless`: sim -> PNG/WAV with no display, for CI/golden verification
     ├── bin/gate.rs     bin `gate`: size budget + PE import allowlist check (host tool, not shipped)
     └── platform/
+        ├── mod.rs      picks one backend per target and re-exports it as `platform::backend`
         ├── win32.rs    the ONLY unsafe/FFI in the project: window, GDI blit, input, waveOut, timing
-        └── macos.rs    cfg-gated best-effort dev backend, not shipped, not a ship gate
+        └── macos.rs    cfg-gated best-effort dev backend (winit/softbuffer/cpal, safe Rust),
+                        not shipped, not a ship gate
 ```
+
+The two backends expose an identical API, so `main.rs` names neither and is
+not cfg-split — it imports `platform::backend`. The macOS backend translates
+winit key codes into the same Windows virtual-key codes `main.rs` polls, and
+carries `#![forbid(unsafe_code)]` of its own: `win32.rs` remains the only
+file in the project containing `unsafe`.
 
 `floppy_core` depends on nothing; `floppy_render` and `floppy_audio` depend
 only on `floppy_core`; `floppy_io` depends on nothing. The three binaries

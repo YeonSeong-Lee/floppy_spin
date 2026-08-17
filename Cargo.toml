@@ -21,6 +21,15 @@ floppy_render = { path = "crates/floppy_render" }
 floppy_audio = { path = "crates/floppy_audio" }
 floppy_io = { path = "crates/floppy_io" }
 
+# macOS dev backend only (SPEC §2 decision record). Gated on `target_os = "macos"`
+# so these never enter the shipped `x86_64-pc-windows-gnu` build graph, the import
+# allowlist (SPEC §12.3), or the size budget (C1) — the Windows build still resolves
+# to exactly the four path deps above and needs zero extra installs.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+cpal = "0.15"
+
 [workspace]
 members = [
     "crates/floppy_core",

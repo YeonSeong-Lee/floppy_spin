@@ -43,8 +43,17 @@ profile builds, runs, and is 241,664 bytes.
   `vcruntime` unless static).
 - The macOS dev backend (winit+softbuffer+cpal, safe Rust) is cfg-gated behind
   `target_os = "macos"` in `[target.'cfg(...)'.dependencies]`, so it never enters the
-  Windows build graph or size budget. It is best-effort (cannot be compiled or tested on
-  this machine) and is not a ship gate.
+  Windows build graph or size budget. It is best-effort and is **not** a ship gate.
+  Implemented and verified on macOS 2026-08-17 (this decision record originally
+  said it could not be compiled or tested — that was true only of the Windows
+  machine the record was written on): `cargo test --workspace --release` and
+  `--golden check` are green on `aarch64-apple-darwin`, all six goldens at
+  mean-abs-diff 0.000. `rust-toolchain.toml` pins a Windows *host* toolchain, so
+  macOS invocations must select the host toolchain with `RUSTUP_TOOLCHAIN=stable`.
+  Each backend is re-exported as `platform::backend`, and `main.rs` is not
+  cfg-split, so a macOS compile exercises the same `main.rs` source Windows
+  compiles. The gates that judge the shipped artifact (§12.3 size/imports and
+  §12.5 hardware) still run only on Windows.
 
 ## 3. Rendering approach (decision record)
 
