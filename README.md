@@ -163,6 +163,23 @@ Because gates 1 and 5 are Windows-only, **any change touching `main.rs`,
 (`docs/notes/ship-gate-clean-checkout.md`) — a green macOS run does not
 retire it.
 
+### CI
+
+`.github/workflows/ci.yml` runs gates 1–4 on a `windows-latest` runner and,
+in a second job, the platform-independent ones on `macos-latest`. Because
+Actions always starts from a fresh clone, the clean-checkout ship gate is
+satisfied by construction on every push rather than by remembering to run
+it. The Windows job is deliberately uncached for the same reason, and it
+uploads the built `floppy_spin.exe` as a run artifact, so a playable binary
+is available without a Windows machine being used to produce it.
+
+The workflow does **not** cover SPEC §12.5 — input feel, waveOut glitching,
+and blit pacing still need a human at real Windows hardware.
+
+Do not add a Linux job: neither `cfg(windows)` nor `cfg(target_os =
+"macos")` matches there, so `platform::backend` does not exist and the
+build fails by design.
+
 ## Architecture
 
 ```

@@ -1,0 +1,142 @@
+name: CI
+
+# The Windows job below is the ship gate (SPEC §12.1–12.4). It exists because
+# of docs/notes/ship-gate-clean-checkout.md: the only honest final gate is a
+# fresh clone with the whole battery run on it, after the last code change.
+# GitHub Actions gives that by construction — every run starts from a clean
+# checkout — so the gate stops depending on someone remembering to re-run it.
+#
+# What CI still cannot do is SPEC §12.5: input feel, waveOut glitching and GDI
+# blit pacing need a human at a real Windows machine
+# (docs/real-hardware-checklist.md). Everything else is here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The verdict that counts: builds the shipped artifact on Windows and
+  # measures it. Deliberately uncached — a cached target/ would mean this job
+  # no longer proves the thing it exists to prove, that a fresh clone builds
+  # with zero extra installs.
+  # ---------------------------------------------------------------------------
+  windows-ship-gate:
+    name: Windows ship gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins stable-x86_64-pc-windows-gnu and rustup would
+      # auto-install it on first use, but a minimal auto-install omits
+      # clippy/rustfmt (docs/notes/windows-gnu-toolchain.md) — ask explicitly.
+      - name: Install the pinned gnu host toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component clippy --component rustfmt
+          rustup show
+
+      - name: Build the shipped exe
+        run: cargo build --release
+
+      # SPEC §12.3 — size budget + PE import allowlist. The one gate that can
+      # only ever run here: it reads a Windows PE.
+      - name: Size + import allowlist
+        run: cargo run --release --bin gate
+
+      # SPEC §12.2 — golden frames against the checked-in PNGs.
+      - name: Golden frames
+        run: cargo run --release --bin headless -- --golden check
+
+      # SPEC §12.1 — the full suite, including the golden-WAV integration test.
+      - name: Tests
+        run: cargo test --workspace --release
+
+      # SPEC §12.4. `-D warnings` makes "clippy clean" enforced rather than
+      # merely claimed.
+      - name: Clippy
+        run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
+
+      # SPEC §5: same seed + same script => identical output, run to run. The
+      # test suite checks frame hashes; this checks the audio path end to end,
+      # on bytes.
+      - name: Determinism double-run
+        shell: bash
+        run: |
+          cargo run --release --bin headless -- --wav "$RUNNER_TEMP/run1.wav" --frames 600
+          cargo run --release --bin headless -- --wav "$RUNNER_TEMP/run2.wav" --frames 600
+          cmp "$RUNNER_TEMP/run1.wav" "$RUNNER_TEMP/run2.wav"
+          echo "determinism: two runs byte-identical"
+
+      # Makes every green main build a downloadable, playable exe — the game
+      # can be handed to a Windows machine without one being used to build it.
+      - name: Upload floppy_spin.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: floppy_spin-exe
+          # Both paths, because which one cargo writes depends on how the
+          # pinned toolchain's default target resolves (README, "Building").
+          # upload-artifact only errors when *no* pattern matches.
+          path: |
+            target/release/floppy_spin.exe
+            target/x86_64-pc-windows-gnu/release/floppy_spin.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Not a ship gate — this job keeps the cross-architecture determinism claim
+  # honest. The six goldens are generated on Windows/x86_64; rendering them
+  # byte-identically on aarch64 is what turns "deterministic" from "reproducible
+  # on one machine" into an actual property of the code. It also keeps the
+  # macOS dev backend compiling, and with it main.rs, which is not cfg-split.
+  #
+  # Do NOT add ubuntu here: neither cfg(windows) nor cfg(target_os = "macos")
+  # matches, so platform::backend does not exist and the build fails.
+  # ---------------------------------------------------------------------------
+  macos-determinism:
+    name: macOS cross-arch determinism
+    runs-on: macos-latest
+    env:
+      # rust-toolchain.toml pins a Windows *host* toolchain, so bare cargo dies
+      # here with "target tuple in channel name". This env var outranks the
+      # file; a `rustup override` would not.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+
+      # Caching is fine on this job (unlike the ship gate) because nothing here
+      # is a claim about building from scratch.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: Tests
+        run: cargo test --workspace --release
+
+      - name: Golden frames (must match the Windows-generated PNGs)
+        run: cargo run --release --bin headless -- --golden check
+
+      - name: Clippy
+        run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
