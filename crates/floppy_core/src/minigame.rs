@@ -158,6 +158,29 @@ pub struct MinigameState {
 }
 
 impl MinigameState {
+    pub(crate) fn write_digest(&self, hash: &mut crate::hash::Hasher64) {
+        hash.write_u8(self.stage as u8);
+        hash.write_f32(self.heading);
+        hash.write_f32(self.depth);
+        hash.write_u8(self.spin_dir as u8);
+        hash.write_f32(self.power_phase);
+        hash.write_f32(self.power_period);
+        match self.result {
+            Some(choice) => {
+                hash.write_bool(true);
+                hash.write_f32(choice.heading);
+                hash.write_f32(choice.depth);
+                hash.write_u8(choice.spin_dir as u8);
+                hash.write_f32(choice.power_frac);
+                hash.write_f32(choice.quality);
+                hash.write_f32(choice.bonus_meter);
+                hash.write_f32(choice.start_tilt);
+            }
+            None => hash.write_bool(false),
+        }
+        hash.write_u16(self.prev.pack());
+    }
+
     /// Fresh minigame starting at `Stage::Aim`, heading `0.0`, depth at the
     /// documented range's midpoint, spin direction defaulted to the chosen
     /// top's preset spin (game_design.md §3) — the player can still flip it

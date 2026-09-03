@@ -2,7 +2,7 @@
 //! crate's public API — these exercise `Mixer` + `Tracker` + `sfx` together
 //! the way a real game loop would, unlike the in-module unit tests.
 
-use floppy_audio::{on_event, play, Mixer, Sfx, SongId, Tracker, SAMPLE_RATE};
+use floppy_audio::{on_event, play, AudioEngine, Mixer, Sfx, SongId, Tracker, SAMPLE_RATE};
 use floppy_core::hash::hash_u32s;
 use floppy_core::physics::BattleEvent;
 use floppy_core::vec::Vec3;
@@ -87,6 +87,29 @@ fn menu_and_battle_hashes_differ() {
     let menu = render_scripted(SongId::Menu, 2);
     let battle = render_scripted(SongId::Battle, 2);
     assert_ne!(hash_samples(&menu), hash_samples(&battle));
+}
+
+fn render_engine_chunks(chunk: usize) -> (Vec<i16>, Vec<(u64, u32, bool)>) {
+    let total = SAMPLE_RATE as usize * 2;
+    let mut pcm = vec![0i16; total];
+    let mut cues = Vec::new();
+    let mut engine = AudioEngine::new(SongId::Battle);
+    let mut offset = 0;
+    while offset < total {
+        let end = (offset + chunk).min(total);
+        let batch = engine.render(&mut pcm[offset..end]);
+        cues.extend(batch.cues().map(|cue| (cue.sample, cue.row, cue.kick)));
+        offset = end;
+    }
+    (pcm, cues)
+}
+
+#[test]
+fn audio_engine_is_byte_identical_for_every_chunk_size() {
+    let expected = render_engine_chunks(1);
+    for chunk in [37usize, 512, 1024] {
+        assert_eq!(render_engine_chunks(chunk), expected, "chunk size {chunk}");
+    }
 }
 
 /// Test 8 (perf smoke): 5s of the battle theme with 8 SFX overlaid renders

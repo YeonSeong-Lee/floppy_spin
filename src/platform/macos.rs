@@ -23,6 +23,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,7 @@ fn push_chunk(queue: &mut VecDeque<i16>, mono: &[i16]) -> bool {
 
 struct AudioRing {
     queue: Arc<Mutex<VecDeque<i16>>>,
+    played_samples: Arc<AtomicU64>,
     /// `None` until [`AudioRing::open`] succeeds, and on any machine with no
     /// usable output device — the whole ring then degrades to a no-op and the
     /// game runs silent rather than failing to start (same contract as
@@ -159,6 +161,7 @@ impl AudioRing {
     fn silent() -> AudioRing {
         AudioRing {
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            played_samples: Arc::new(AtomicU64::new(0)),
             stream: None,
         }
     }
@@ -201,20 +204,26 @@ impl AudioRing {
         let channels = supported.channels() as usize;
         let config: cpal::StreamConfig = supported.config();
         let cb_queue = Arc::clone(&queue);
+        let played_samples = Arc::new(AtomicU64::new(0));
+        let cb_played_samples = Arc::clone(&played_samples);
 
         let stream = device.build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut q = lock_queue(&cb_queue);
+                let mut consumed = 0u64;
                 for frame in out.chunks_mut(channels) {
                     // Underrun fills silence rather than repeating the last
                     // sample: a gap is easier to hear (and diagnose) than a
                     // buzz, and `main.rs` tops the ring up every frame.
-                    let s = q.pop_front().unwrap_or(0) as f32 / 32_768.0;
+                    let queued = q.pop_front();
+                    consumed += u64::from(queued.is_some());
+                    let s = queued.unwrap_or(0) as f32 / 32_768.0;
                     for ch in frame.iter_mut() {
                         *ch = s;
                     }
                 }
+                cb_played_samples.fetch_add(consumed, Ordering::Relaxed);
             },
             |err| eprintln!("[macos] audio stream error: {err}"),
             None,
@@ -228,6 +237,7 @@ impl AudioRing {
                 }
                 AudioRing {
                     queue,
+                    played_samples,
                     stream: Some(stream),
                 }
             }
@@ -255,6 +265,10 @@ impl AudioRing {
         push_chunk(&mut lock_queue(&self.queue), mono);
     }
 
+    fn playback_cursor(&self) -> u64 {
+        self.played_samples.load(Ordering::Relaxed)
+    }
+
     fn shutdown(&mut self) {
         if let Some(stream) = self.stream.take() {
             let _ = stream.pause();
@@ -278,6 +292,9 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     /// Down/up state indexed by Windows VK code, exactly like `win32`'s.
     keys: [bool; 256],
+    pressed: [bool; 256],
+    released: [bool; 256],
+    focused: bool,
     quit: bool,
 }
 
@@ -289,6 +306,9 @@ impl App {
             window: None,
             surface: None,
             keys: [false; 256],
+            pressed: [false; 256],
+            released: [false; 256],
+            focused: true,
             quit: false,
         }
     }
@@ -302,7 +322,7 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
             .with_inner_size(self.initial_size)
-            .with_resizable(true);
+            .with_resizable(false);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -333,15 +353,27 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(vk) = vk_for(code) {
-                        self.keys[vk as usize] = event.state == ElementState::Pressed;
+                        let key = vk as usize;
+                        let down = event.state == ElementState::Pressed;
+                        if down && !self.keys[key] {
+                            self.pressed[key] = true;
+                        } else if !down && self.keys[key] {
+                            self.released[key] = true;
+                        }
+                        self.keys[key] = down;
                     }
                 }
             }
             WindowEvent::Focused(false) => {
                 // Dropping focus mid-press would otherwise leave the key stuck
                 // down forever, since the KeyUp goes to whoever took focus.
+                for key in 0..self.keys.len() {
+                    self.released[key] |= self.keys[key];
+                }
                 self.keys = [false; 256];
+                self.focused = false;
             }
+            WindowEvent::Focused(true) => self.focused = true,
             _ => {}
         }
     }
@@ -368,8 +400,8 @@ impl Platform {
     /// points and pumps the event loop until it exists (winit only creates
     /// windows from inside `resumed`, but this constructor must hand back a
     /// live window like `win32`'s does).
-    pub fn init(title: &str, client_w: i32, client_h: i32) -> Platform {
-        let mut event_loop = EventLoop::new().expect("could not create the macOS event loop");
+    pub fn init(title: &str, client_w: i32, client_h: i32) -> Result<Platform, String> {
+        let mut event_loop = EventLoop::new().map_err(|error| error.to_string())?;
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = App::new(title, client_w, client_h);
 
@@ -386,11 +418,10 @@ impl Platform {
             std::thread::sleep(Duration::from_millis(5));
         }
         if app.window.is_none() {
-            eprintln!("[macos] window never became available");
-            app.quit = true;
+            return Err("window never became available".to_owned());
         }
 
-        Platform {
+        Ok(Platform {
             event_loop,
             app,
             start: Instant::now(),
@@ -399,20 +430,34 @@ impl Platform {
             // which is the X1 case for every current caller, so a boot-time
             // `set_window_scale(X1)` is correctly seen as a no-op.
             window_scale: WindowScaleMode::X1,
-        }
+        })
     }
 
     /// Opens the cpal output stream. Call once after `init`. Safe to call with
     /// no audio device present — the ring degrades to a silent no-op path and
     /// the game still runs.
-    pub fn audio_init(&mut self) {
+    pub fn audio_init(&mut self) -> Result<(), &'static str> {
         self.audio = AudioRing::open();
+        if self.audio.stream.is_some() {
+            Ok(())
+        } else {
+            Err("audio output initialization failed")
+        }
     }
 
     /// Ring slots currently free to accept a fresh [`AUDIO_BUFFER_FRAMES`]
     /// -long mono chunk (0 if `audio_init` was never called, or no device).
     pub fn audio_free_buffers(&mut self) -> usize {
         self.audio.free_count()
+    }
+
+    pub fn audio_available(&self) -> bool {
+        self.audio.stream.is_some()
+    }
+
+    /// Mono sample position consumed by the output device callback.
+    pub fn audio_playback_cursor(&self) -> u64 {
+        self.audio.playback_cursor()
     }
 
     /// Submit one [`AUDIO_BUFFER_FRAMES`]-length mono chunk, duplicated across
@@ -426,6 +471,8 @@ impl Platform {
     /// `false` once the window has been closed (the caller should stop calling
     /// poll and exit).
     pub fn poll(&mut self) -> bool {
+        self.app.pressed = [false; 256];
+        self.app.released = [false; 256];
         if let PumpStatus::Exit(_) = self
             .event_loop
             .pump_app_events(Some(Duration::ZERO), &mut self.app)
@@ -438,6 +485,18 @@ impl Platform {
     /// Current down/up state of virtual-key `vk`.
     pub fn key(&self, vk: u8) -> bool {
         self.app.keys[vk as usize]
+    }
+
+    pub fn key_pressed(&self, vk: u8) -> bool {
+        self.app.pressed[vk as usize]
+    }
+
+    pub fn key_released(&self, vk: u8) -> bool {
+        self.app.released[vk as usize]
+    }
+
+    pub fn focused(&self) -> bool {
+        self.app.focused
     }
 
     /// Scales the 0x00RRGGBB `fb` (top-down, `fb_w`x`fb_h`) onto the window's
@@ -467,11 +526,19 @@ impl Platform {
 
         let (src_w, src_h) = (fb_w as usize, fb_h as usize);
         let (dst_w, dst_h) = (dst_w.get() as usize, dst_h.get() as usize);
-        for y in 0..dst_h {
-            let src_row = (y * src_h / dst_h) * src_w;
-            let dst_row = y * dst_w;
-            for x in 0..dst_w {
-                buf[dst_row + x] = fb[src_row + (x * src_w / dst_w)];
+        buf.fill(0);
+        let (view_w, view_h) = if dst_w * src_h > dst_h * src_w {
+            (dst_h * src_w / src_h, dst_h)
+        } else {
+            (dst_w, dst_w * src_h / src_w)
+        };
+        let view_x = (dst_w - view_w) / 2;
+        let view_y = (dst_h - view_h) / 2;
+        for y in 0..view_h {
+            let src_row = (y * src_h / view_h) * src_w;
+            let dst_row = (view_y + y) * dst_w + view_x;
+            for x in 0..view_w {
+                buf[dst_row + x] = fb[src_row + (x * src_w / view_w)];
             }
         }
         let _ = buf.present();
@@ -479,9 +546,9 @@ impl Platform {
 
     /// Applies a window-scale tier: the three windowed tiers resize the client
     /// area, `Fullscreen` goes borderless on the current monitor.
-    pub fn set_window_scale(&mut self, mode: WindowScaleMode) {
+    pub fn set_window_scale(&mut self, mode: WindowScaleMode) -> Result<(), &'static str> {
         if mode == self.window_scale {
-            return;
+            return Ok(());
         }
         if let Some(window) = self.app.window.as_ref() {
             match mode {
@@ -497,8 +564,11 @@ impl Platform {
                     let _ = window.request_inner_size(LogicalSize::new(w, h));
                 }
             }
+        } else {
+            return Err("window is unavailable");
         }
         self.window_scale = mode;
+        Ok(())
     }
 
     /// Seconds since an arbitrary epoch, from a monotonic `Instant`.
@@ -549,12 +619,14 @@ pub fn save_load() -> Vec<u8> {
 
 /// Best-effort save write: create the directory if missing, then write. Never
 /// panics, never propagates an error — a failed save is silently dropped.
-pub fn save_store(bytes: &[u8]) {
+pub fn save_store(bytes: &[u8]) -> std::io::Result<()> {
     let Some(dir) = save_dir() else {
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME is unavailable",
+        ));
     };
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(SAVE_FILE_NAME), bytes);
+    floppy_io::save_store::atomic_write(&dir.join(SAVE_FILE_NAME), bytes)
 }
 
 #[cfg(test)]

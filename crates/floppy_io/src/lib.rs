@@ -4,4 +4,5 @@
 pub mod golden;
 pub mod pe;
 pub mod png;
+pub mod save_store;
 pub mod wav;

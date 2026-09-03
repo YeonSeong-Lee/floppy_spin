@@ -40,14 +40,15 @@ These are non-negotiable and enforced by the `gate` tool and the test suite
 
 ## Building
 
-The toolchain is pinned in `rust-toolchain.toml` to the rustup **host**
-toolchain `stable-x86_64-pc-windows-gnu`. On a Windows machine with rustup,
-no extra installs are required — the gnu host toolchain bundles the MinGW
-linker, CRT startup objects, and system-DLL import libraries needed to
-produce the `x86_64-pc-windows-gnu` target.
+`rust-toolchain.toml` pins Rust 1.97.1 while letting rustup select the current
+machine's host. Shipping builds still use the GNU Windows host explicitly,
+because that toolchain bundles the MinGW linker, CRT startup objects, and
+system-DLL import libraries needed to produce the `x86_64-pc-windows-gnu`
+target without a separate MinGW install:
 
 ```
-cargo build --release
+rustup toolchain install 1.97.1-x86_64-pc-windows-gnu --profile minimal --component clippy --component rustfmt
+cargo +1.97.1-x86_64-pc-windows-gnu build --release
 ```
 
 The shipping binary lands at `target/release/floppy_spin.exe` (also
@@ -70,13 +71,12 @@ The game also builds and runs on macOS through a cfg-gated dev backend
 is a development convenience, **not** a shipping target and **not** a ship
 gate — `floppy_spin.exe` remains the only artifact any §12 gate judges.
 
-Because `rust-toolchain.toml` pins a Windows *host* toolchain, bare `cargo`
-fails here with `target tuple in channel name`. Select the host toolchain
-explicitly instead:
+The toolchain pin is host-neutral, so the normal commands work directly on
+both Intel and Apple Silicon Macs:
 
 ```
-RUSTUP_TOOLCHAIN=stable cargo run --release
-RUSTUP_TOOLCHAIN=stable cargo test --workspace --release
+cargo run --release --bin floppy_spin
+cargo test --workspace --release
 ```
 
 The macOS-only dependencies live under
@@ -133,9 +133,9 @@ Three binaries plus the test suite gate every change:
    `-- --golden write` to regenerate the checked-in PNGs after an
    intentional visual change. The same binary also writes golden WAV audio
    (`-- --wav out.wav --frames N`) for headless audio verification.
-3. **`cargo test --workspace --release`** — 312 tests on Windows, 319 on
-   macOS (each platform compiles only its own backend, and the macOS one
-   carries 7 unit tests of its own), covering math properties, physics
+3. **`cargo test --workspace --release`** — the current macOS suite has 335
+   passing tests plus one ignored performance smoke test (each platform
+   compiles only its own backend), covering math properties, physics
    invariants (collision symmetry,
    grounded stability, ring-out, topple), flow reachability, combat verb
    unit tests, frame-hash determinism, AI balance (Hard beats Easy in >70%
@@ -148,11 +148,11 @@ must both be clean; both are part of the ship gate.
 
 ### What runs where
 
-Gates 2, 3, clippy, and fmt are platform-independent and run on macOS too
-(prefix them with `RUSTUP_TOOLCHAIN=stable`). Gate 1 compiles anywhere but
-only means anything against a Windows PE, and SPEC §12.5's real-hardware
+Gates 2, 3, clippy, and fmt are platform-independent and run on macOS too.
+Gate 1 compiles anywhere but only means anything against a Windows PE, and
+SPEC §12.5's real-hardware
 checks are Windows-only by definition. Measured on `aarch64-apple-darwin`
-2026-08-17: 319 tests pass and all six goldens compare at mean-abs-diff
+2026-09-04: 335 tests pass and all six goldens compare at mean-abs-diff
 **0.000** — not merely inside the tolerance rule but byte-identical to PNGs
 generated on Windows/x86_64, which is the determinism claim above holding
 across two architectures rather than just across two runs.

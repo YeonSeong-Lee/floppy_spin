@@ -3,14 +3,14 @@
 
 mod platform;
 
-use floppy_audio::{on_event, play, Mixer, Sfx, SongId, Tracker};
+use floppy_audio::Sfx;
 use floppy_core::arena;
 use floppy_core::clock::SimClock;
 use floppy_core::combat;
 use floppy_core::fixmath;
 use floppy_core::flow::{self, FlowState, MatchPhase, Screen, MATCH_WIN_POINTS};
-use floppy_core::input::InputState;
-use floppy_core::physics::{self, BattleEvent, TUNE};
+use floppy_core::input::{FrameInput, InputState};
+use floppy_core::physics::{self, BattleEvent};
 use floppy_core::rng::Rng;
 use floppy_core::roster::Preset;
 use floppy_core::save;
@@ -20,11 +20,13 @@ use floppy_render::frame::Frame;
 use floppy_render::particles::{self, ParticlePool};
 use floppy_render::post::PostState;
 use floppy_render::{hud, vfx};
+use floppy_spin::{AppRuntime, ExitReason, PlaybackCursor, PresentationEvent, RuntimeConfig};
 use platform::backend::{self, Platform, WindowScaleMode, AUDIO_BUFFER_FRAMES, VK_ESCAPE};
 
 const W: usize = 960;
 const H: usize = 540;
 const FRAME_DT: f64 = 1.0 / 60.0;
+const SILENT_AUDIO_FRAMES: usize = floppy_audio::SAMPLE_RATE as usize / 60;
 /// Spin-wait the tail of the frame instead of sleeping through it, so pacing
 /// lands on the 16.666ms boundary precisely; Sleep()'s ~1ms granularity can't.
 const SPIN_MARGIN_S: f64 = 0.0015;
@@ -51,30 +53,42 @@ const VK_C: u8 = 0x43;
 /// `-x`, i.e. `dir_x = -1`; pressing Up must move up-screen (away from the
 /// camera, world `+z`), i.e. `dir_y = -1`. Menu logic in `flow` is written
 /// against the same constants, so arrows behave naturally everywhere.
-fn read_input(p: &Platform) -> InputState {
+fn read_keys(key: impl Fn(u8) -> bool) -> InputState {
     let mut dir_x: i8 = 0;
     let mut dir_y: i8 = 0;
-    if p.key(VK_LEFT) {
+    if key(VK_LEFT) {
         dir_x += flow::DIR_LEFT;
     }
-    if p.key(VK_RIGHT) {
+    if key(VK_RIGHT) {
         dir_x += flow::DIR_RIGHT;
     }
-    if p.key(VK_UP) {
+    if key(VK_UP) {
         dir_y += flow::DIR_UP;
     }
-    if p.key(VK_DOWN) {
+    if key(VK_DOWN) {
         dir_y += flow::DIR_DOWN;
     }
     InputState {
         dir_x,
         dir_y,
-        dash: p.key(VK_SPACE),
-        special: p.key(VK_SHIFT),
-        guard: p.key(VK_Z),
-        hop: p.key(VK_X),
-        carve: p.key(VK_C),
-        anchor: p.key(VK_CONTROL),
+        dash: key(VK_SPACE),
+        special: key(VK_SHIFT),
+        guard: key(VK_Z),
+        hop: key(VK_X),
+        carve: key(VK_C),
+        anchor: key(VK_CONTROL),
+    }
+}
+
+fn read_input(p: &Platform) -> FrameInput {
+    FrameInput {
+        held: read_keys(|key| p.key(key)),
+        pressed: read_keys(|key| p.key_pressed(key)),
+        released: read_keys(|key| p.key_released(key)),
+        escape_held: p.key(VK_ESCAPE),
+        escape_pressed: p.key_pressed(VK_ESCAPE),
+        escape_released: p.key_released(VK_ESCAPE),
+        focused: p.focused(),
     }
 }
 
@@ -97,6 +111,7 @@ struct Vfx {
     post: PostState,
     particles: ParticlePool,
     shake: vfx::ShakeState,
+    shake_offset: (f32, f32),
     flash: vfx::FlashState,
     /// Arena ring-pulse intensity (Task 4), decayed/kicked in the audio
     /// submission loop below (that's where `Tracker::row_index()` actually
@@ -126,6 +141,7 @@ impl Vfx {
             post: PostState::new(W, H),
             particles: ParticlePool::new(),
             shake: vfx::ShakeState::default(),
+            shake_offset: (0.0, 0.0),
             flash: vfx::FlashState::new(),
             ring_pulse: 0.0,
             rng: Rng::new(1),
@@ -279,7 +295,11 @@ fn detect_wall_bounces(v: &mut Vfx, prev: &physics::World, curr: &physics::World
 /// music wiring's own cadence in `main`). Returns whether the screen
 /// discriminant changed this call (so `main` can react once, e.g. firing
 /// round/match-win VFX below).
-fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
+fn advance_vfx_for_flow_frame(
+    v: &mut Vfx,
+    flow_state: &FlowState,
+    events: &[PresentationEvent],
+) -> bool {
     let screen_changed = v.prev_screen != flow_state.screen;
     v.prev_screen = flow_state.screen;
     if screen_changed {
@@ -309,8 +329,10 @@ fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
     ];
 
     if let Some(world) = &flow_state.world {
-        for ev in &flow_state.frame_events {
-            handle_battle_event(v, world, ev, presets);
+        for event in events {
+            if let PresentationEvent::Battle(ev) = event {
+                handle_battle_event(v, world, ev, presets);
+            }
         }
         if let Some(prev) = &flow_state.world_prev {
             detect_wall_bounces(v, prev, world);
@@ -400,6 +422,9 @@ fn advance_vfx_for_flow_frame(v: &mut Vfx, flow_state: &FlowState) -> bool {
 
     v.particles.update();
     v.shake.step();
+    v.shake_offset = v
+        .shake
+        .offset(&mut v.rng, vfx::shake_level_mult(flow_state.settings.shake));
     v.flash.step();
 
     screen_changed
@@ -418,8 +443,7 @@ fn render(
 ) {
     vfxs.post.begin_frame();
 
-    let shake_mult = vfx::shake_level_mult(flow_state.settings.shake);
-    let shake_offset = vfxs.shake.offset(&mut vfxs.rng, shake_mult);
+    let shake_offset = vfxs.shake_offset;
     let flash_color = vfxs.flash.current();
     let colorblind = flow_state.settings.colorblind;
 
@@ -651,94 +675,34 @@ fn window_scale_mode_for(scale: flow::WindowScale) -> WindowScaleMode {
 /// cosmetic-preview Intro/Launch phases, so the riser builds tension into
 /// the fight rather than only starting once Fight begins — and every other
 /// screen uses the menu theme.
-fn song_for_screen(screen: Screen) -> SongId {
-    match screen {
-        Screen::Match(_) => SongId::Battle,
-        _ => SongId::Menu,
-    }
-}
-
-/// The small `Copy` slice of `FlowState` menu-navigation actually needed to
-/// detect cursor/screen deltas for menu SFX — deliberately NOT a clone of
-/// the whole `FlowState` (which would drag along the live `World`, RNG
-/// state, etc. for no reason every flow frame).
-#[derive(Clone, Copy)]
-struct MenuNavSnapshot {
-    screen: Screen,
-    menu_cursor: usize,
-    select_cursor: usize,
-    settings_cursor: usize,
-}
-
-impl MenuNavSnapshot {
-    fn of(flow_state: &FlowState) -> Self {
-        Self {
-            screen: flow_state.screen,
-            menu_cursor: flow_state.menu_cursor,
-            select_cursor: flow_state.select_cursor,
-            settings_cursor: flow_state.settings_cursor,
-        }
-    }
-}
-
-/// Menu navigation SFX, detected from screen/cursor deltas across one flow
-/// frame. `flow::FlowState` doesn't expose cursor-edit events directly, so
-/// this is deliberately render-side (main.rs), per the milestone brief's
-/// explicit "or skip" escape hatch for menu blips — a curated, judgment-call
-/// mapping rather than an exhaustive one: cursor moves within a screen read
-/// as `MenuMove`; a hand-picked set of screen-transition edges reads as
-/// "select" (entering a sub-screen, or confirming a TopSelect pick) or
-/// "back" (leaving one, aborting a match, or leaving MatchOver). Transitions
-/// not listed here (e.g. RoundResult's "any key" advance, which already has
-/// its own tally-ting cue via `Sfx::ScoreTally` elsewhere) are silent by
-/// design, not by omission.
-fn menu_sfx_for(prev: MenuNavSnapshot, cur: MenuNavSnapshot) -> Option<Sfx> {
-    use Screen::*;
-    if prev.screen == cur.screen {
-        return match cur.screen {
-            MainMenu if prev.menu_cursor != cur.menu_cursor => Some(Sfx::MenuMove),
-            TopSelect if prev.select_cursor != cur.select_cursor => Some(Sfx::MenuMove),
-            Settings if prev.settings_cursor != cur.settings_cursor => Some(Sfx::MenuMove),
-            _ => None,
-        };
-    }
-    match (prev.screen, cur.screen) {
-        (Title, MainMenu) => Some(Sfx::MenuSelect),
-        (MainMenu, TopSelect) | (MainMenu, Garage) | (MainMenu, Settings) => Some(Sfx::MenuSelect),
-        (TopSelect, Match(MatchPhase::Intro)) => Some(Sfx::MenuSelect),
-        (TopSelect, MainMenu) | (Garage, MainMenu) | (Settings, MainMenu) => Some(Sfx::MenuBack),
-        (Match(_), MainMenu) => Some(Sfx::MenuBack),
-        (MatchOver, MainMenu) => Some(Sfx::MenuBack),
-        _ => None,
-    }
-}
-
 fn main() {
-    let mut platform = Platform::init("FLOPPY SPIN", W as i32, H as i32);
-    platform.audio_init();
+    let Ok(mut platform) = Platform::init("FLOPPY SPIN", W as i32, H as i32) else {
+        eprintln!("could not initialize the platform");
+        return;
+    };
+    if let Err(error) = platform.audio_init() {
+        eprintln!("{error}; continuing without audio");
+    }
     let scene = BattleScene::new();
     let mut frame = Frame::new(W, H);
     let mut vfxs = Vfx::new();
 
-    // Fixed base seed: the flow folds menu timing (total frames until the
-    // player confirms a top) into each match seed, so matches still vary
-    // run-to-run while everything inside core stays wall-clock-free.
-    let mut flow_state = FlowState::new(0xF10B_B75E);
-
-    // ---- M8 Task 6: load-on-boot (SPEC §9). `platform::save_load` returns
-    // an empty Vec on ANY failure (no %APPDATA%, no file, ...) and
-    // `save::decode` turns anything that isn't a fully-valid blob
-    // (including empty) into `SaveState::default()` — so this line alone
-    // covers "no save file yet" and "corrupt save file" identically, with
-    // no branching needed here.
-    flow_state.apply_save(save::decode(&backend::save_load()));
+    let mut runtime = AppRuntime::new(
+        RuntimeConfig::default(),
+        save::decode_outcome(&backend::save_load()),
+    )
+    .expect("runtime initialization is infallible for validated config");
 
     // ---- Window-scale (SPEC §7): apply the now-loaded setting once at
     // boot, so a persisted non-default scale takes effect immediately
     // instead of only after the player revisits Settings. `set_window_scale`
     // itself no-ops if the mode already matches `Platform::init`'s starting
     // X1, so this is cheap on the (default) common case.
-    platform.set_window_scale(window_scale_mode_for(flow_state.settings.window_scale));
+    if let Err(error) = platform.set_window_scale(window_scale_mode_for(
+        runtime.render(0.0).state.settings.window_scale,
+    )) {
+        eprintln!("could not apply saved window scale: {error}");
+    }
 
     // Fixed-timestep pump (SPEC §5): the SimClock banks wall time into whole
     // 120 Hz steps; every SIM_STEPS_PER_FLOW_FRAME (2) banked steps run one
@@ -749,16 +713,8 @@ fn main() {
     let mut pending_steps: u32 = 0;
     let mut last_t = platform.now_s();
 
-    // Audio (Task M6-B / SPEC §8): one `Mixer` for the process lifetime; the
-    // `Tracker` is replaced wholesale on a song switch (no fade — see the
-    // milestone report). `hum_active` remembers whether the spin-hum voice
-    // was sounding so leaving Fight sends exactly one release trigger
-    // (`spin_hum`'s own zero-rpm path handles the actual fade, see
-    // `floppy_audio::sfx`).
-    let mut mixer = Mixer::new();
-    let mut current_song = song_for_screen(flow_state.screen);
-    let mut tracker = Tracker::new(current_song);
-    let mut hum_active = false;
+    let mut playback_cursor = PlaybackCursor::default();
+    let mut exit_reason = ExitReason::WindowClosed;
 
     loop {
         let frame_start = platform.now_s();
@@ -767,117 +723,57 @@ fn main() {
             break;
         }
         let input = read_input(&platform);
-        let esc = platform.key(VK_ESCAPE);
 
         let dt = frame_start - last_t;
         last_t = frame_start;
         pending_steps += clock.advance(dt, 8);
         while pending_steps >= flow::SIM_STEPS_PER_FLOW_FRAME {
-            let prev_nav = MenuNavSnapshot::of(&flow_state);
+            if platform.audio_available() {
+                playback_cursor.0 = platform.audio_playback_cursor();
+            }
             let prev_tally = vfxs.prev_tally;
-
-            flow_state.advance(input, esc);
+            let effects = runtime.advance(input, playback_cursor);
             pending_steps -= flow::SIM_STEPS_PER_FLOW_FRAME;
-
-            // ---- M8 Task 6: persist on leaving Garage or Settings (SPEC
-            // §9). Screen-transition edge, not every frame: `prev_nav.screen`
-            // (captured above, before this `advance`) was Garage/Settings and
-            // the new screen isn't, i.e. the player just backed out — that's
-            // the natural "commit this build/these settings" moment for
-            // both screens (Garage: Z/Esc backs to MainMenu after part
-            // swaps; Settings: same, after adjustments). Writing on every
-            // frame would mean a write per keystroke while adjusting a
-            // slider, which is unnecessary I/O for a file this small.
-            if prev_nav.screen != flow_state.screen
-                && matches!(prev_nav.screen, Screen::Garage | Screen::Settings)
-            {
-                let (parts, settings) = flow_state.save_snapshot();
-                backend::save_store(&save::encode(parts, &settings));
-            }
-
-            // ---- Window-scale (SPEC §7): re-apply on the same "leaving
-            // Settings" edge as the persist write just above — the only
-            // screen where `window_scale` can change. `set_window_scale`
-            // itself no-ops when the mode is unchanged, so this never
-            // thrashes the window if the player left Settings without
-            // touching that row.
-            if prev_nav.screen != flow_state.screen && matches!(prev_nav.screen, Screen::Settings) {
-                platform.set_window_scale(window_scale_mode_for(flow_state.settings.window_scale));
-            }
-
-            // ---- Music: replace the Tracker wholesale on a song switch.
-            let desired_song = song_for_screen(flow_state.screen);
-            if desired_song != current_song {
-                tracker = Tracker::new(desired_song);
-                current_song = desired_song;
-            }
-
-            // ---- Intensity layer (game_design.md §8): on iff either top
-            // has a special Armed, only during Fight.
-            let armed_in_fight = matches!(flow_state.screen, Screen::Match(MatchPhase::Fight))
-                && flow_state
-                    .world
-                    .as_ref()
-                    .map(|w| w.tops[0].combat.special_armed || w.tops[1].combat.special_armed)
-                    .unwrap_or(false);
-            tracker.set_intensity(armed_in_fight);
-
-            // ---- SFX from BattleEvents. `flow.frame_events` accumulates
-            // across ALL of the frame's sim sub-steps (see its doc comment —
-            // reading `world.events` here instead would drop every event the
-            // first of the 2 sub-steps produced), and it's cleared at the
-            // top of every `advance()`, so draining it unconditionally is
-            // correct on every screen including the exact Fight→Decided
-            // transition frame that carries the finishing hit.
-            for ev in &flow_state.frame_events {
-                on_event(&mut mixer, ev);
-            }
-
-            // ---- Spin hum: steady per-flow-frame retrigger/retune while
-            // fighting (P1's top only — SPEC §8 reserves a single dedicated
-            // hum voice, not one per top); one explicit release the frame
-            // Fight ends.
-            if matches!(flow_state.screen, Screen::Match(MatchPhase::Fight)) {
-                if let Some(world) = &flow_state.world {
-                    let rpm_frac = world.tops[0].spin / TUNE.spin_max;
-                    play(&mut mixer, Sfx::SpinHum { rpm_frac });
-                    hum_active = true;
+            if let Some(bytes) = effects.save.as_deref() {
+                if let Err(error) = backend::save_store(bytes) {
+                    eprintln!("could not save settings: {error}");
+                } else {
+                    runtime.mark_saved();
                 }
-            } else if hum_active {
-                play(&mut mixer, Sfx::SpinHum { rpm_frac: 0.0 });
-                hum_active = false;
             }
-
-            // ---- Menu navigation blips (cursor/screen deltas).
-            if let Some(sfx) = menu_sfx_for(prev_nav, MenuNavSnapshot::of(&flow_state)) {
-                play(&mut mixer, sfx);
+            if let Some(scale) = effects.window_scale {
+                if let Err(error) = platform.set_window_scale(window_scale_mode_for(scale)) {
+                    eprintln!("could not change window scale: {error}");
+                }
             }
-
-            // ---- M7 VFX: shake/flash/particles/springs/wipe/pip-tally.
-            advance_vfx_for_flow_frame(&mut vfxs, &flow_state);
+            for event in effects.events.iter() {
+                if let PresentationEvent::MusicRow(cue) = event {
+                    vfxs.prev_tracker_row = cue.row;
+                    vfxs.ring_pulse = vfx::ring_pulse_step(vfxs.ring_pulse, cue.kick);
+                }
+            }
+            advance_vfx_for_flow_frame(
+                &mut vfxs,
+                runtime.render(0.0).state,
+                effects.events.as_slice(),
+            );
             if vfxs.prev_tally > prev_tally {
-                play(&mut mixer, Sfx::ScoreTally);
+                runtime.play_ui_sfx(Sfx::ScoreTally);
+            }
+            if effects.exit_requested {
+                exit_reason = ExitReason::Requested;
+            }
+            if !platform.audio_available() {
+                let mut silent = [0i16; SILENT_AUDIO_FRAMES];
+                runtime.render_audio(&mut silent);
+                playback_cursor.0 = playback_cursor.0.saturating_add(SILENT_AUDIO_FRAMES as u64);
             }
         }
         // Esc semantics (quit on Title/MainMenu, back/abort elsewhere) are
         // decided entirely inside flow::advance.
-        if flow_state.quit_requested {
-            // ---- M8 Task 6: persist on quit (SPEC §9), so settings/garage
-            // changes made since the last Garage/Settings-exit (e.g. the
-            // player tweaked Settings then immediately quit from MainMenu
-            // without a further screen transition) are never silently lost.
-            let (parts, settings) = flow_state.save_snapshot();
-            backend::save_store(&save::encode(parts, &settings));
+        if runtime.render(0.0).state.quit_requested {
             break;
         }
-
-        // ---- Volume settings -> group gains (SPEC §7: music/SFX volume
-        // 0..=10). Pure f32 multiply before soft-clip inside the mixer, so
-        // this stays deterministic (SPEC §5).
-        mixer.set_group_gains(
-            flow_state.settings.sfx_vol as f32 / 10.0,
-            flow_state.settings.music_vol as f32 / 10.0,
-        );
 
         // ---- waveOut ring pump (Task M6-B): fill every currently-free
         // ring buffer with exactly `AUDIO_BUFFER_FRAMES` fresh mono samples.
@@ -895,31 +791,52 @@ fn main() {
         let free_buffers = platform.audio_free_buffers();
         let mut mono = [0i16; AUDIO_BUFFER_FRAMES];
         for _ in 0..free_buffers {
-            tracker.advance(&mut mixer, AUDIO_BUFFER_FRAMES as u32);
-            mixer.render(&mut mono);
+            runtime.render_audio(&mut mono);
             platform.audio_submit(&mono);
-
-            let row = tracker.row_index();
-            let kicked = row != vfxs.prev_tracker_row && tracker.kick_on_current_row();
-            vfxs.prev_tracker_row = row;
-            vfxs.ring_pulse = vfx::ring_pulse_step(vfxs.ring_pulse, kicked);
         }
 
         // Render interpolation factor: fraction of the way from the previous
         // sim state to the current one. A leftover banked step means we're
         // already a full step past `world` — clamp to 1 (never extrapolate).
         let alpha = (pending_steps as f32 + clock.alpha()).min(1.0);
-        render(&mut frame, &flow_state, &scene, alpha, &mut vfxs);
+        let view = runtime.render(alpha);
+        render(&mut frame, view.state, &scene, view.alpha, &mut vfxs);
         platform.blit(&frame.px, W as i32, H as i32);
 
-        // Pace to 60 fps: sleep off the coarse remainder, leaving a small
-        // margin, then spin-wait onto the exact frame boundary. Never
-        // busy-spins the whole frame.
+        // Pace close to 60 fps without a busy-spin tail. A tiny oversleep is
+        // preferable to burning a CPU core; fixed-step simulation absorbs it.
         let target = frame_start + FRAME_DT;
         let remaining = target - platform.now_s();
         if remaining > SPIN_MARGIN_S {
             Platform::sleep_ms(((remaining - SPIN_MARGIN_S) * 1000.0) as u32);
         }
-        while platform.now_s() < target {}
+        if remaining > 0.0 {
+            Platform::sleep_ms(1);
+        }
+    }
+    if let Some(bytes) = runtime.finish(exit_reason).save {
+        if let Err(error) = backend::save_store(&bytes) {
+            eprintln!("could not save on shutdown: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_render_does_not_consume_vfx_rng() {
+        let flow = FlowState::new(7);
+        let scene = BattleScene::new();
+        let mut vfx = Vfx::new();
+        advance_vfx_for_flow_frame(&mut vfx, &flow, &[]);
+        let rng_before = vfx.rng.state();
+        let mut first = Frame::new(W, H);
+        let mut second = Frame::new(W, H);
+        render(&mut first, &flow, &scene, 0.5, &mut vfx);
+        render(&mut second, &flow, &scene, 0.5, &mut vfx);
+        assert_eq!(vfx.rng.state(), rng_before);
+        assert_eq!(first.px, second.px);
     }
 }

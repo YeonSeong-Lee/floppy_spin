@@ -649,6 +649,33 @@ impl Tracker {
             remaining -= step;
         }
     }
+
+    /// Render PCM without moving a row event earlier than its exact sample.
+    /// `on_row` receives `(row, kick, offset_in_output)` immediately after
+    /// the row's notes have been triggered and before that row is rendered.
+    pub(crate) fn render(
+        &mut self,
+        mixer: &mut Mixer,
+        out: &mut [i16],
+        mut on_row: impl FnMut(u32, bool, usize),
+    ) {
+        let mut offset = 0;
+        while offset < out.len() {
+            if self.samples_until_next_row == 0 {
+                if self.started {
+                    self.row = (self.row + 1) % self.total_rows;
+                }
+                self.started = true;
+                self.fire_row(mixer);
+                self.samples_until_next_row = self.row_len_samples();
+                on_row(self.row, self.kick_on_current_row(), offset);
+            }
+            let count = (out.len() - offset).min(self.samples_until_next_row as usize);
+            mixer.render(&mut out[offset..offset + count]);
+            self.samples_until_next_row -= count as u32;
+            offset += count;
+        }
+    }
 }
 
 #[cfg(test)]

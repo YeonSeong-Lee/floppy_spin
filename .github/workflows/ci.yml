@@ -37,15 +37,18 @@ jobs:
   windows-ship-gate:
     name: Windows ship gate
     runs-on: windows-latest
+    env:
+      # The repo pin is host-neutral for macOS development. Ship checks must
+      # nevertheless use the self-contained GNU host toolchain (SPEC §2).
+      RUSTUP_TOOLCHAIN: 1.97.1-x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins stable-x86_64-pc-windows-gnu and rustup would
-      # auto-install it on first use, but a minimal auto-install omits
-      # clippy/rustfmt (docs/notes/windows-gnu-toolchain.md) — ask explicitly.
+      # A minimal auto-install omits clippy/rustfmt
+      # (docs/notes/windows-gnu-toolchain.md), so ask explicitly.
       - name: Install the pinned gnu host toolchain
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component clippy --component rustfmt
+          rustup toolchain install 1.97.1-x86_64-pc-windows-gnu --profile minimal --component clippy --component rustfmt
           rustup show
 
       - name: Build the shipped exe
@@ -110,11 +113,6 @@ jobs:
   macos-determinism:
     name: macOS cross-arch determinism
     runs-on: macos-latest
-    env:
-      # rust-toolchain.toml pins a Windows *host* toolchain, so bare cargo dies
-      # here with "target tuple in channel name". This env var outranks the
-      # file; a `rustup override` would not.
-      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
 

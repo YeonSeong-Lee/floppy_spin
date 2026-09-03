@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+mod engine;
 pub mod env;
 pub mod mixer;
 pub mod osc;
@@ -44,6 +45,7 @@ pub const SAMPLE_RATE: u32 = 44_100;
 
 // Re-exports: the handful of types a caller (game loop / platform layer)
 // actually needs to wire this crate up, without reaching into submodules.
+pub use engine::{AudioBatch, AudioCue, AudioEngine};
 pub use env::AdsrParams;
 pub use mixer::{Mixer, VoiceParams};
 pub use osc::Waveform;

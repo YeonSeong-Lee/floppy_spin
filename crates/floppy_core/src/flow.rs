@@ -42,7 +42,7 @@
 use crate::ai;
 use crate::combat::SpecialId;
 use crate::garage::{self, DEFAULT_PARTS};
-use crate::input::InputState;
+use crate::input::{FrameInput, InputState};
 use crate::minigame::{ai_roll, Difficulty, LaunchChoice, MinigameState};
 use crate::physics::{BattleEvent, LaunchParams, Outcome, World};
 use crate::rng::{mix_seed, Rng};
@@ -485,6 +485,73 @@ fn adjust_setting(s: &mut GameSettings, row: usize, delta: i32) {
 }
 
 impl FlowState {
+    pub(crate) fn write_digest(&self, hash: &mut crate::hash::Hasher64) {
+        let screen = match self.screen {
+            Screen::Boot => 0,
+            Screen::Title => 1,
+            Screen::MainMenu => 2,
+            Screen::TopSelect => 3,
+            Screen::Garage => 4,
+            Screen::Settings => 5,
+            Screen::Match(phase) => 6 + phase as u8,
+            Screen::MatchOver => 11,
+        };
+        hash.write_u8(screen);
+        hash.write_u32(self.frame);
+        hash.write_u64(self.total_frames);
+        for value in [
+            self.menu_cursor,
+            self.settings_cursor,
+            self.select_cursor,
+            self.p1_pick,
+            self.ai_pick,
+            self.garage_slot,
+        ] {
+            hash.write_u32(value as u32);
+        }
+        hash.write_bytes(&self.parts);
+        hash.write_bytes(&self.score);
+        hash.write_u32(self.round);
+        hash.write_u64(self.match_seed);
+        hash.write_u8(self.settings.music_vol);
+        hash.write_u8(self.settings.sfx_vol);
+        hash.write_u8(self.settings.shake as u8);
+        hash.write_u8(self.settings.difficulty as u8);
+        hash.write_u8(self.settings.window_scale as u8);
+        hash.write_bool(self.settings.colorblind);
+        hash.write_bool(self.quit_requested);
+        self.minigame.write_digest(hash);
+        write_launch_choice(hash, self.ai_choice);
+        match &self.ai_state {
+            Some(ai) => {
+                hash.write_bool(true);
+                ai.write_digest(hash);
+            }
+            None => hash.write_bool(false),
+        }
+        for world in [&self.world, &self.world_prev] {
+            match world {
+                Some(world) => {
+                    hash.write_bool(true);
+                    hash.write_u64(world.state_hash());
+                }
+                None => hash.write_bool(false),
+            }
+        }
+        hash.write_u8(match self.last_outcome {
+            None => 0,
+            Some(Outcome::RingOut { loser }) => 1 + loser,
+            Some(Outcome::StaminaOut { loser }) => 3 + loser,
+            Some(Outcome::Simultaneous) => 5,
+        });
+        hash.write_u8(self.last_winner.map_or(0, |winner| winner + 1));
+        hash.write_u8(self.last_points);
+        hash.write_u8(self.last_round_end.map_or(0, |end| end as u8 + 1));
+        hash.write_u64(self.base_seed);
+        hash.write_u16(self.prev_input.pack());
+        hash.write_bool(self.prev_esc);
+    }
+
     /// Fresh flow at the Boot screen. `base_seed` is the only entropy the
     /// flow ever receives; everything downstream (match seed, AI pick, AI
     /// launch roll, round worlds) derives from it plus input timing.
@@ -592,8 +659,16 @@ impl FlowState {
 
     fn refresh_preview(&mut self) {
         let w = self.preview_world();
-        self.world_prev = Some(w.clone());
+        self.capture_world_prev(&w);
         self.world = Some(w);
+    }
+
+    fn capture_world_prev(&mut self, world: &World) {
+        if let Some(previous) = self.world_prev.as_mut() {
+            previous.clone_from(world);
+        } else {
+            self.world_prev = Some(world.clone());
+        }
     }
 
     /// TopSelect confirm: lock picks, derive the match seed, roll the AI's
@@ -707,6 +782,32 @@ impl FlowState {
     /// helper methods mutate data but never `screen`.
     pub fn advance(&mut self, input: InputState, esc: bool) {
         let e = detect_edges(self.prev_input, input, self.prev_esc, esc);
+        self.advance_inner(FrameInput::from_held(input, esc), e);
+    }
+
+    /// Advance from a host edge latch. Unlike [`Self::advance`], this cannot
+    /// lose a press that begins and ends within one platform poll.
+    pub fn advance_frame(&mut self, input: FrameInput) {
+        let held = input.held;
+        let pressed = input.pressed;
+        let e = Edges {
+            up: pressed.dir_y == DIR_UP,
+            down: pressed.dir_y == DIR_DOWN,
+            left: pressed.dir_x == DIR_LEFT,
+            right: pressed.dir_x == DIR_RIGHT,
+            dash: pressed.dash,
+            back: pressed.guard,
+            esc: input.escape_pressed,
+            any_key: pressed.pack() & 0x03ff != InputState::default().pack(),
+        };
+        self.advance_inner(input, e);
+        self.prev_input = held;
+        self.prev_esc = input.escape_held;
+    }
+
+    fn advance_inner(&mut self, frame_input: FrameInput, e: Edges) {
+        let input = frame_input.held;
+        let esc = frame_input.escape_held;
         let mut next: Option<Screen> = None;
         // Fresh event window every flow frame; only the Fight arm refills it.
         self.frame_events.clear();
@@ -836,8 +937,8 @@ impl FlowState {
                     next = Some(Screen::MainMenu);
                 } else {
                     let mut locked = None;
-                    for _ in 0..SIM_STEPS_PER_FLOW_FRAME {
-                        if let Some(c) = self.minigame.step(input) {
+                    for substep in 0..SIM_STEPS_PER_FLOW_FRAME {
+                        if let Some(c) = self.minigame.step(frame_input.for_substep(substep == 0)) {
                             locked = Some(c);
                             break;
                         }
@@ -863,7 +964,7 @@ impl FlowState {
                     // AI call below never needs to borrow `self.settings`
                     // alongside the mutable `self.ai_state` borrow.
                     let params = ai::tier(self.settings.difficulty);
-                    for _ in 0..SIM_STEPS_PER_FLOW_FRAME {
+                    for substep in 0..SIM_STEPS_PER_FLOW_FRAME {
                         if world.outcome.is_some() {
                             break;
                         }
@@ -876,8 +977,8 @@ impl FlowState {
                             // rather than an idle one.
                             None => chase_input(&world),
                         };
-                        self.world_prev = Some(world.clone());
-                        world.step([input, ai_input]);
+                        self.capture_world_prev(&world);
+                        world.step([frame_input.for_substep(substep == 0), ai_input]);
                         self.frame_events.extend_from_slice(&world.events);
                     }
                     if let Some(outcome) = world.outcome {
@@ -969,6 +1070,22 @@ impl FlowState {
     /// Settings-exit, and quit).
     pub fn save_snapshot(&self) -> ([u8; 5], GameSettings) {
         (self.parts, self.settings)
+    }
+}
+
+fn write_launch_choice(hash: &mut crate::hash::Hasher64, choice: Option<LaunchChoice>) {
+    match choice {
+        Some(choice) => {
+            hash.write_bool(true);
+            hash.write_f32(choice.heading);
+            hash.write_f32(choice.depth);
+            hash.write_u8(choice.spin_dir as u8);
+            hash.write_f32(choice.power_frac);
+            hash.write_f32(choice.quality);
+            hash.write_f32(choice.bonus_meter);
+            hash.write_f32(choice.start_tilt);
+        }
+        None => hash.write_bool(false),
     }
 }
 

@@ -11,6 +11,7 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 // ---------------------------------------------------------------------------
@@ -43,9 +44,8 @@ type LONG_PTR = isize;
 // ---- waveOut (Task M6-B) ---------------------------------------------------
 /// Opaque waveOut device handle.
 type HWAVEOUT = *mut c_void;
-/// `UINT_PTR`/`DWORD_PTR`: pointer-sized on every ABI winmm.dll ships for,
-/// which on `x86_64-pc-windows-gnu` (SPEC C2) is exactly `usize`.
-type UINT_PTR = usize;
+/// `DWORD_PTR`: pointer-sized on every ABI winmm.dll ships for, which on
+/// `x86_64-pc-windows-gnu` (SPEC C2) is exactly `usize`.
 type DWORD_PTR = usize;
 /// `MMRESULT` is a plain `UINT` return code (`MMSYSERR_*`/`WAVERR_*`).
 type MMRESULT = u32;
@@ -106,7 +106,7 @@ struct BITMAPINFOHEADER {
 }
 
 /// `WAVEFORMATEX` (winmm.h), PCM case (`cbSize` unused, kept 0).
-#[repr(C)]
+#[repr(C, packed(1))]
 struct WAVEFORMATEX {
     wFormatTag: WORD,
     nChannels: WORD,
@@ -132,6 +132,24 @@ struct WAVEHDR {
     reserved: DWORD_PTR,
 }
 
+/// `MMTIME`'s largest union member is the eight-byte SMPTE representation.
+#[repr(C)]
+union MMTIME_VALUE {
+    sample: DWORD,
+    storage: [DWORD; 2],
+}
+
+#[repr(C)]
+struct MMTIME {
+    wType: UINT,
+    u: MMTIME_VALUE,
+}
+
+// Windows x64 ABI guards for the two structures retained by waveOut.
+const _: () = assert!(size_of::<WAVEFORMATEX>() == 18);
+const _: () = assert!(size_of::<WAVEHDR>() == 48);
+const _: () = assert!(size_of::<MMTIME>() == 12);
+
 // ---------------------------------------------------------------------------
 // Constants (only what's actually used below).
 // ---------------------------------------------------------------------------
@@ -141,6 +159,9 @@ const CS_HREDRAW: UINT = 0x0002;
 const CS_OWNDC: UINT = 0x0020;
 
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF_0000;
+const WS_THICKFRAME: DWORD = 0x0004_0000;
+const WS_MAXIMIZEBOX: DWORD = 0x0001_0000;
+const WS_WINDOWED: DWORD = WS_OVERLAPPEDWINDOW & !WS_THICKFRAME & !WS_MAXIMIZEBOX;
 const WS_POPUP: DWORD = 0x8000_0000;
 const WS_VISIBLE: DWORD = 0x1000_0000;
 
@@ -163,6 +184,8 @@ const WM_PAINT: UINT = 0x000F;
 const WM_QUIT: UINT = 0x0012;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
+const WM_KILLFOCUS: UINT = 0x0008;
+const WM_SETFOCUS: UINT = 0x0007;
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_SYSKEYUP: UINT = 0x0105;
 
@@ -174,26 +197,29 @@ const IDC_ARROW: usize = 32512;
 const BI_RGB: DWORD = 0;
 const DIB_RGB_COLORS: UINT = 0;
 const SRCCOPY: DWORD = 0x00CC_0020;
+const BLACKNESS: DWORD = 0x0000_0042;
 const COLORONCOLOR: i32 = 3;
+const MOVEFILE_REPLACE_EXISTING: DWORD = 0x0000_0001;
+const MOVEFILE_WRITE_THROUGH: DWORD = 0x0000_0008;
 
 /// Virtual-key code for Escape (main's quit key).
 pub const VK_ESCAPE: u8 = 0x1B;
 
 // ---- waveOut (Task M6-B; SPEC §8) ------------------------------------------
 
-/// `(UINT)-1` widened to `UINT_PTR`: "let the driver pick the default
+/// `(UINT)-1`: "let the driver pick the default
 /// device", passed as `waveOutOpen`'s device-ID argument.
-const WAVE_MAPPER: UINT_PTR = 0xFFFF_FFFF;
-/// No callback function/window/thread/event (HARD RULES: single-threaded,
-/// polling only — `WHDR_DONE` is checked from the main loop, never a
-/// callback).
-const CALLBACK_NULL: DWORD = 0x0000_0000;
+const WAVE_MAPPER: UINT = 0xFFFF_FFFF;
+/// Deliver `MM_WOM_DONE` to the platform window. This keeps completion on the
+/// existing single-threaded message pump and avoids an audio callback thread.
+const CALLBACK_WINDOW: DWORD = 0x0001_0000;
 const WAVE_FORMAT_PCM: WORD = 1;
 const MMSYSERR_NOERROR: MMRESULT = 0;
 /// Set once `waveOutWrite` has finished playing a buffer — this is the flag
 /// `AudioRing::free_count`/`submit` poll from the main loop (HARD RULES: no
 /// callback, no event handle; plain polling).
 const WHDR_DONE: DWORD = 0x0000_0001;
+const TIME_SAMPLES: UINT = 0x0002;
 
 // ---------------------------------------------------------------------------
 // extern "system" FFI surface. Only what's used is declared (per SPEC C8).
@@ -253,6 +279,7 @@ extern "system" {
 
 #[link(name = "gdi32")]
 extern "system" {
+    fn PatBlt(hdc: HDC, x: i32, y: i32, width: i32, height: i32, rop: DWORD) -> BOOL;
     #[allow(clippy::too_many_arguments)]
     fn StretchDIBits(
         hdc: HDC,
@@ -281,6 +308,7 @@ extern "system" {
     // ---- Save I/O (Task M8-3; SPEC §9) ----
     fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: *mut u16, nSize: DWORD) -> DWORD;
     fn CreateDirectoryW(lpPathName: LPCWSTR, lpSecurityAttributes: LPVOID) -> BOOL;
+    fn MoveFileExW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, dwFlags: DWORD) -> BOOL;
 }
 
 #[link(name = "winmm")]
@@ -290,7 +318,7 @@ extern "system" {
 
     fn waveOutOpen(
         phwo: *mut HWAVEOUT,
-        uDeviceID: UINT_PTR,
+        uDeviceID: UINT,
         pwfx: *const WAVEFORMATEX,
         dwCallback: DWORD_PTR,
         dwInstance: DWORD_PTR,
@@ -299,6 +327,7 @@ extern "system" {
     fn waveOutPrepareHeader(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
     fn waveOutUnprepareHeader(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
     fn waveOutWrite(hwo: HWAVEOUT, pwh: *mut WAVEHDR, cbwh: UINT) -> MMRESULT;
+    fn waveOutGetPosition(hwo: HWAVEOUT, pmmt: *mut MMTIME, cbmmt: UINT) -> MMRESULT;
     fn waveOutReset(hwo: HWAVEOUT) -> MMRESULT;
     fn waveOutClose(hwo: HWAVEOUT) -> MMRESULT;
 }
@@ -313,7 +342,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM
     unsafe {
         match msg {
             WM_CLOSE => {
-                DestroyWindow(hwnd);
+                // The message pump records the request. Destruction is
+                // deferred until Platform::drop, after AppRuntime::finish.
                 0
             }
             WM_DESTROY => {
@@ -345,9 +375,9 @@ fn to_wstring(s: &str) -> Vec<u16> {
 // and then recycled forever via repeated `waveOutWrite` calls on the same
 // still-prepared `WAVEHDR` (a standard waveOut ring technique — re-preparing
 // per write is unnecessary and would be wasted work every frame). No
-// callback, no dedicated thread, no event handle (CALLBACK_NULL): the main
-// loop polls each header's `WHDR_DONE` bit once a frame and only refills/
-// requeues buffers that have actually finished playing.
+// window-message callback, no dedicated thread and no event handle. winmm
+// posts completion to the existing message pump and sets `WHDR_DONE`; the
+// main loop then recycles only headers that have actually completed.
 //
 // Buffer memory (`AudioBuffer::data`, a `Vec<i16>`) is heap-allocated once at
 // `AudioRing::open` and never resized afterward, so the raw pointer stashed
@@ -393,6 +423,8 @@ impl AudioBuffer {
 struct AudioRing {
     hwo: HWAVEOUT,
     buffers: Vec<AudioBuffer>,
+    last_device_cursor: DWORD,
+    playback_cursor: u64,
 }
 
 impl AudioRing {
@@ -402,6 +434,8 @@ impl AudioRing {
         AudioRing {
             hwo: ptr::null_mut(),
             buffers: Vec::new(),
+            last_device_cursor: 0,
+            playback_cursor: 0,
         }
     }
 
@@ -411,7 +445,7 @@ impl AudioRing {
     /// no-op state instead of propagating an error — there is no sim-visible
     /// consequence to running with audio off (HARD RULES: audio never writes
     /// anything sim-visible).
-    fn open() -> AudioRing {
+    fn open(callback_window: HWND) -> AudioRing {
         let block_align = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
         let wfx = WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM,
@@ -424,7 +458,16 @@ impl AudioRing {
         };
 
         let mut hwo: HWAVEOUT = ptr::null_mut();
-        let result = unsafe { waveOutOpen(&mut hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) };
+        let result = unsafe {
+            waveOutOpen(
+                &mut hwo,
+                WAVE_MAPPER,
+                &wfx,
+                callback_window as DWORD_PTR,
+                0,
+                CALLBACK_WINDOW,
+            )
+        };
         if result != MMSYSERR_NOERROR || hwo.is_null() {
             return AudioRing::closed();
         }
@@ -475,7 +518,12 @@ impl AudioRing {
             }
         }
 
-        AudioRing { hwo, buffers }
+        AudioRing {
+            hwo,
+            buffers,
+            last_device_cursor: 0,
+            playback_cursor: 0,
+        }
     }
 
     /// Ring slots currently free to accept a fresh `AUDIO_BUFFER_FRAMES`-long
@@ -513,6 +561,28 @@ impl AudioRing {
         }
     }
 
+    /// Monotonic mono sample position reported by waveOut. The native sample
+    /// counter is 32-bit, so accumulate wrapping deltas into a 64-bit cursor.
+    fn playback_cursor(&mut self) -> u64 {
+        if self.hwo.is_null() {
+            return 0;
+        }
+        let mut position = MMTIME {
+            wType: TIME_SAMPLES,
+            u: MMTIME_VALUE { storage: [0; 2] },
+        };
+        let result =
+            unsafe { waveOutGetPosition(self.hwo, &mut position, size_of::<MMTIME>() as UINT) };
+        if result == MMSYSERR_NOERROR && position.wType == TIME_SAMPLES {
+            let raw = unsafe { position.u.sample };
+            self.playback_cursor = self
+                .playback_cursor
+                .saturating_add(raw.wrapping_sub(self.last_device_cursor) as u64);
+            self.last_device_cursor = raw;
+        }
+        self.playback_cursor
+    }
+
     /// `waveOutReset` (stop + mark every buffer done) -> `UnprepareHeader`
     /// each buffer -> `waveOutClose`, in that order — the order the Windows
     /// docs prescribe to avoid a hang (module brief). A no-op with no device.
@@ -528,6 +598,12 @@ impl AudioRing {
             waveOutClose(self.hwo);
         }
         self.hwo = ptr::null_mut();
+    }
+}
+
+impl Drop for AudioRing {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -567,6 +643,9 @@ pub struct Platform {
     hwnd: HWND,
     hdc: HDC,
     keys: [bool; 256],
+    pressed: [bool; 256],
+    released: [bool; 256],
+    focused: bool,
     quit: bool,
     qpc_freq: f64,
     audio: AudioRing,
@@ -580,7 +659,7 @@ impl Platform {
     /// Registers the window class, creates a resizable overlapped window
     /// whose CLIENT area is exactly `client_w`x`client_h` and centers it on
     /// the primary monitor, then shows it.
-    pub fn init(title: &str, client_w: i32, client_h: i32) -> Platform {
+    pub fn init(title: &str, client_w: i32, client_h: i32) -> Result<Platform, &'static str> {
         let class_name = to_wstring("FloppySpinWndClass");
         let title_w = to_wstring(title);
 
@@ -609,7 +688,7 @@ impl Platform {
                 right: client_w,
                 bottom: client_h,
             };
-            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, 0);
+            AdjustWindowRect(&mut rect, WS_WINDOWED, 0);
             let win_w = rect.right - rect.left;
             let win_h = rect.bottom - rect.top;
 
@@ -622,7 +701,7 @@ impl Platform {
                 0,
                 class_name.as_ptr(),
                 title_w.as_ptr(),
-                WS_OVERLAPPEDWINDOW,
+                WS_WINDOWED,
                 x,
                 y,
                 win_w,
@@ -632,23 +711,38 @@ impl Platform {
                 hinstance,
                 ptr::null_mut(),
             );
+            if hwnd.is_null() {
+                return Err("CreateWindowExW failed");
+            }
 
             ShowWindow(hwnd, SW_SHOW);
 
             // CS_OWNDC gives this window a private DC we can hold for its
             // whole lifetime instead of Get/Release around every blit.
             let hdc = GetDC(hwnd);
+            if hdc.is_null() {
+                DestroyWindow(hwnd);
+                return Err("GetDC failed");
+            }
             SetStretchBltMode(hdc, COLORONCOLOR);
 
             timeBeginPeriod(1);
 
             let mut freq: i64 = 0;
-            QueryPerformanceFrequency(&mut freq);
+            if QueryPerformanceFrequency(&mut freq) == 0 || freq <= 0 {
+                timeEndPeriod(1);
+                ReleaseDC(hwnd, hdc);
+                DestroyWindow(hwnd);
+                return Err("QueryPerformanceFrequency failed");
+            }
 
-            Platform {
+            Ok(Platform {
                 hwnd,
                 hdc,
                 keys: [false; 256],
+                pressed: [false; 256],
+                released: [false; 256],
+                focused: true,
                 quit: false,
                 qpc_freq: freq as f64,
                 audio: AudioRing::closed(),
@@ -658,21 +752,35 @@ impl Platform {
                 // point so a boot-time `set_window_scale(X1)` call is
                 // correctly recognized as a no-op.
                 window_scale: WindowScaleMode::X1,
-            }
+            })
         }
     }
 
     /// Opens the waveOut ring (module docs above `AudioRing`). Call once
     /// after `init`. Safe to call even if no audio device is present — the
     /// ring degrades to a silent no-op path and the game still runs.
-    pub fn audio_init(&mut self) {
-        self.audio = AudioRing::open();
+    pub fn audio_init(&mut self) -> Result<(), &'static str> {
+        self.audio = AudioRing::open(self.hwnd);
+        if self.audio.hwo.is_null() {
+            Err("waveOut initialization failed")
+        } else {
+            Ok(())
+        }
     }
 
     /// Ring slots currently free to accept a fresh [`AUDIO_BUFFER_FRAMES`]
     /// -long mono chunk (0 if `audio_init` was never called, or no device).
     pub fn audio_free_buffers(&mut self) -> usize {
         self.audio.free_count()
+    }
+
+    pub fn audio_available(&self) -> bool {
+        !self.audio.hwo.is_null()
+    }
+
+    /// Mono sample position actually consumed by waveOut.
+    pub fn audio_playback_cursor(&mut self) -> u64 {
+        self.audio.playback_cursor()
     }
 
     /// Submit one [`AUDIO_BUFFER_FRAMES`]-length mono chunk: duplicated to
@@ -686,17 +794,36 @@ impl Platform {
     /// WM_SYSKEYDOWN/UP. Returns `false` once WM_CLOSE/WM_DESTROY has posted
     /// WM_QUIT (the caller should stop calling poll and exit).
     pub fn poll(&mut self) -> bool {
+        self.pressed = [false; 256];
+        self.released = [false; 256];
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 match msg.message {
                     WM_QUIT => self.quit = true,
+                    WM_CLOSE => self.quit = true,
                     WM_KEYDOWN | WM_SYSKEYDOWN => {
-                        self.keys[(msg.wParam & 0xFF) as usize] = true;
+                        let key = (msg.wParam & 0xFF) as usize;
+                        if !self.keys[key] {
+                            self.pressed[key] = true;
+                        }
+                        self.keys[key] = true;
                     }
                     WM_KEYUP | WM_SYSKEYUP => {
-                        self.keys[(msg.wParam & 0xFF) as usize] = false;
+                        let key = (msg.wParam & 0xFF) as usize;
+                        if self.keys[key] {
+                            self.released[key] = true;
+                        }
+                        self.keys[key] = false;
                     }
+                    WM_KILLFOCUS => {
+                        for key in 0..self.keys.len() {
+                            self.released[key] |= self.keys[key];
+                        }
+                        self.keys = [false; 256];
+                        self.focused = false;
+                    }
+                    WM_SETFOCUS => self.focused = true,
                     _ => {}
                 }
                 TranslateMessage(&msg);
@@ -711,6 +838,18 @@ impl Platform {
         self.keys[vk as usize]
     }
 
+    pub fn key_pressed(&self, vk: u8) -> bool {
+        self.pressed[vk as usize]
+    }
+
+    pub fn key_released(&self, vk: u8) -> bool {
+        self.released[vk as usize]
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     /// Stretches the 0x00RRGGBB `fb` (top-down, `fb_w`x`fb_h`) onto the
     /// window's current client rect (queried fresh each call since the
     /// window is resizable).
@@ -721,6 +860,14 @@ impl Platform {
             GetClientRect(self.hwnd, &mut rect);
             let win_w = rect.right - rect.left;
             let win_h = rect.bottom - rect.top;
+            let (dst_w, dst_h) = if win_w * fb_h > win_h * fb_w {
+                (win_h * fb_w / fb_h, win_h)
+            } else {
+                (win_w, win_w * fb_h / fb_w)
+            };
+            let dst_x = (win_w - dst_w) / 2;
+            let dst_y = (win_h - dst_h) / 2;
+            PatBlt(self.hdc, 0, 0, win_w, win_h, BLACKNESS);
 
             let bmih = BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -738,10 +885,10 @@ impl Platform {
 
             StretchDIBits(
                 self.hdc,
-                0,
-                0,
-                win_w,
-                win_h,
+                dst_x,
+                dst_y,
+                dst_w,
+                dst_h,
                 0,
                 0,
                 fb_w,
@@ -763,15 +910,15 @@ impl Platform {
     /// no-op on any FFI failure — a botched resize must never crash the game
     /// (mirrors the waveOut graceful-degradation posture elsewhere in this
     /// file).
-    pub fn set_window_scale(&mut self, mode: WindowScaleMode) {
+    pub fn set_window_scale(&mut self, mode: WindowScaleMode) -> Result<(), &'static str> {
         if mode == self.window_scale {
-            return;
+            return Ok(());
         }
         if self.hwnd.is_null() {
-            return;
+            return Err("window is unavailable");
         }
 
-        unsafe {
+        let positioned = unsafe {
             // Read the current style so the (comparatively heavier, and
             // SWP_FRAMECHANGED-requiring) SetWindowLongPtrW call only
             // happens when the target style actually differs from the
@@ -795,7 +942,7 @@ impl Platform {
                         screen_w,
                         screen_h,
                         SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
-                    );
+                    )
                 }
                 WindowScaleMode::X1 | WindowScaleMode::X1_5 | WindowScaleMode::X2 => {
                     let scale = match mode {
@@ -809,8 +956,8 @@ impl Platform {
 
                     // Restore the normal overlapped-window style (skipped if
                     // it's already that style, e.g. switching X1 -> X2).
-                    if current_style != WS_OVERLAPPEDWINDOW {
-                        SetWindowLongPtrW(self.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW as LONG_PTR);
+                    if current_style != WS_WINDOWED {
+                        SetWindowLongPtrW(self.hwnd, GWL_STYLE, WS_WINDOWED as LONG_PTR);
                     }
 
                     let mut rect = RECT {
@@ -819,7 +966,7 @@ impl Platform {
                         right: client_w,
                         bottom: client_h,
                     };
-                    AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, 0);
+                    AdjustWindowRect(&mut rect, WS_WINDOWED, 0);
                     let win_w = rect.right - rect.left;
                     let win_h = rect.bottom - rect.top;
 
@@ -836,11 +983,15 @@ impl Platform {
                         win_w,
                         win_h,
                         SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
-                    );
+                    )
                 }
             }
+        };
+        if positioned == 0 {
+            return Err("SetWindowPos failed");
         }
         self.window_scale = mode;
+        Ok(())
     }
 
     /// Seconds since an arbitrary epoch, from QueryPerformanceCounter.
@@ -939,9 +1090,12 @@ pub fn save_load() -> Vec<u8> {
 /// as any other failure here), then `std::fs::write` the bytes. Never
 /// panics, never propagates an error — a failed save is silently dropped
 /// (task brief: "never crash the game over a save").
-pub fn save_store(bytes: &[u8]) {
+pub fn save_store(bytes: &[u8]) -> std::io::Result<()> {
     let Some(appdata) = appdata_dir() else {
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "APPDATA is unavailable",
+        ));
     };
     let dir = std::path::Path::new(&appdata).join(SAVE_DIR_SUBPATH);
     let dir_w = to_wstring(&dir.to_string_lossy());
@@ -951,6 +1105,20 @@ pub fn save_store(bytes: &[u8]) {
         // subsequent write attempt is the real success/failure signal.
         CreateDirectoryW(dir_w.as_ptr(), ptr::null_mut());
     }
-    let path = dir.join("save.bin");
-    let _ = std::fs::write(path, bytes);
+    floppy_io::save_store::atomic_write_with_replace(&dir.join("save.bin"), bytes, |from, to| {
+        let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replaced = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
 }

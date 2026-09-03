@@ -5,6 +5,52 @@
 const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Allocation-free streaming FNV-1a writer for deterministic state digests.
+#[derive(Clone, Copy, Debug)]
+pub struct Hasher64(u64);
+
+impl Default for Hasher64 {
+    fn default() -> Self {
+        Self(OFFSET_BASIS)
+    }
+}
+
+impl Hasher64 {
+    pub fn write_u8(&mut self, value: u8) {
+        self.0 = fold_byte(self.0, value);
+    }
+
+    pub fn write_bool(&mut self, value: bool) {
+        self.write_u8(value as u8);
+    }
+
+    pub fn write_u16(&mut self, value: u16) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    pub fn write_u32(&mut self, value: u32) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    pub fn write_u64(&mut self, value: u64) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    pub fn write_f32(&mut self, value: f32) {
+        self.write_u32(value.to_bits());
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = fold_byte(self.0, byte);
+        }
+    }
+
+    pub fn finish(self) -> u64 {
+        self.0
+    }
+}
+
 #[inline]
 fn fold_byte(hash: u64, byte: u8) -> u64 {
     (hash ^ byte as u64).wrapping_mul(PRIME)

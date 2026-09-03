@@ -10,19 +10,19 @@
 
 use floppy_core::flow::{FlowState, GameSettings, ShakeLevel, WindowScale};
 use floppy_core::minigame::Difficulty;
-use floppy_core::save::{self, SaveState, SAVE_LEN};
+use floppy_core::save::{self, SaveLoadOutcome, SaveState, SAVE_LEN};
 
 #[test]
-fn save_len_matches_the_documented_18_byte_layout() {
-    // magic(4) + version(1) + parts(5) + settings(7) + checksum(1) = 18.
-    assert_eq!(SAVE_LEN, 18);
+fn save_len_matches_the_documented_v2_layout() {
+    // magic(4) + version(1) + parts(5) + settings(7) + xor(1) + crc32(4).
+    assert_eq!(SAVE_LEN, 22);
     let bytes = save::encode([0; 5], &GameSettings::default());
     assert_eq!(bytes.len(), SAVE_LEN);
 }
 
 #[test]
 fn encoded_bytes_match_the_documented_offsets_exactly() {
-    let parts = [1u8, 2, 3, 4, 0];
+    let parts = [1u8, 2, 3, 0, 0];
     let settings = GameSettings {
         music_vol: 5,
         sfx_vol: 6,
@@ -51,6 +51,27 @@ fn encoded_bytes_match_the_documented_offsets_exactly() {
     assert_eq!(bytes[16], 0, "reserved padding byte must be 0");
     let checksum = bytes[..17].iter().fold(0u8, |acc, &b| acc ^ b);
     assert_eq!(bytes[17], checksum, "checksum must be XOR of bytes 0..17");
+    assert_ne!(&bytes[18..22], &[0; 4], "CRC32 follows the XOR byte");
+}
+
+#[test]
+fn v1_is_classified_as_incompatible() {
+    let mut old = vec![0u8; 18];
+    old[..4].copy_from_slice(b"FSPN");
+    old[4] = 1;
+    assert_eq!(
+        save::decode_outcome(&old),
+        SaveLoadOutcome::Incompatible { version: 1 }
+    );
+}
+
+#[test]
+fn invalid_part_and_reserved_byte_are_corrupt() {
+    for offset in [5usize, 16] {
+        let mut bytes = save::encode([0; 5], &GameSettings::default());
+        bytes[offset] = 4;
+        assert_eq!(save::decode_outcome(&bytes), SaveLoadOutcome::Corrupt);
+    }
 }
 
 #[test]

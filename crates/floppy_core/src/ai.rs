@@ -303,6 +303,49 @@ pub struct AiState {
 }
 
 impl AiState {
+    pub(crate) fn write_digest(&self, hash: &mut crate::hash::Hasher64) {
+        hash.write_u64(self.rng.state());
+        hash.write_u32(self.write_idx as u32);
+        hash.write_u32(self.filled as u32);
+        hash.write_u8(self.escape_verb.map_or(0, |verb| verb as u8 + 1));
+        hash.write_bool(self.escape_prev_threat);
+        hash.write_bool(self.escape_hop_fired);
+        hash.write_u16(self.anchor_hold_steps);
+        hash.write_u16(self.anchor_cooldown);
+        for obs in &self.buf {
+            for value in [
+                obs.me_pos.x,
+                obs.me_pos.y,
+                obs.me_pos.z,
+                obs.me_vel.x,
+                obs.me_vel.y,
+                obs.me_vel.z,
+            ] {
+                hash.write_f32(value);
+            }
+            hash.write_f32(obs.me_spin);
+            hash.write_bool(obs.me_grounded);
+            hash.write_u16(obs.me_dash_cd);
+            hash.write_u8(obs.me_hop_land_lag);
+            hash.write_bool(obs.me_special_armed);
+            for value in [
+                obs.opp_pos.x,
+                obs.opp_pos.y,
+                obs.opp_pos.z,
+                obs.opp_vel.x,
+                obs.opp_vel.y,
+                obs.opp_vel.z,
+            ] {
+                hash.write_f32(value);
+            }
+            hash.write_u16(obs.opp_dash_active);
+            hash.write_u8(obs.opp_dash_startup);
+            hash.write_u16(obs.opp_special_active);
+            hash.write_bool(obs.opp_special_armed);
+            hash.write_u8(obs.opp_special_id as u8);
+        }
+    }
+
     /// Fresh AI state seeded from `seed` (the caller mixes in a salt distinct
     /// from the round's own `World::rng` and the launch-roll RNG — see
     /// `flow.rs`'s `AI_FIGHT_SEED_SALT`).

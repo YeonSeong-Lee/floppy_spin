@@ -489,6 +489,20 @@ pub struct Stats {
 }
 
 impl Stats {
+    pub fn new(values: [u8; 6]) -> Result<Self, crate::domain::DomainError> {
+        if let Some(&value) = values.iter().find(|&&value| value > 100) {
+            return Err(crate::domain::DomainError::StatOutOfRange(value));
+        }
+        Ok(Self {
+            atk: values[0],
+            def: values[1],
+            sta: values[2],
+            wgt: values[3],
+            spd: values[4],
+            mtr: values[5],
+        })
+    }
+
     /// `mass = 20 + 0.6*WGT`.
     pub fn mass(&self) -> f32 {
         20.0 + 0.6 * self.wgt as f32
@@ -715,6 +729,39 @@ pub struct World {
     pub hitstop: u8,
     pub outcome: Option<Outcome>,
     pub events: Vec<BattleEvent>,
+}
+
+/// Fixed-capacity serialization scratch used by `World::state_hash`.
+/// Keeping this on the stack makes session digesting allocation-free.
+struct StateWords {
+    words: [u32; 128],
+    len: usize,
+}
+
+impl StateWords {
+    fn new() -> Self {
+        Self {
+            words: [0; 128],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: u32) {
+        assert!(
+            self.len < self.words.len(),
+            "state digest capacity exceeded"
+        );
+        self.words[self.len] = value;
+        self.len += 1;
+    }
+}
+
+impl std::ops::Deref for StateWords {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.words[..self.len]
+    }
 }
 
 /// Build one top's initial state for the Launch phase (game_design.md §4):
@@ -2086,7 +2133,7 @@ impl World {
             outcome,
             events: _,
         } = self;
-        let mut words: Vec<u32> = Vec::with_capacity(64);
+        let mut words = StateWords::new();
         for top in tops {
             let Top {
                 pos,

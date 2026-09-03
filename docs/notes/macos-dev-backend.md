@@ -22,9 +22,10 @@ Implementing it paid back more than convenience:
 
 ## Gotchas worth remembering
 
-- `rust-toolchain.toml` pins a Windows *host* toolchain, so bare `cargo`
-  anywhere else dies with `target tuple in channel name`. `RUSTUP_TOOLCHAIN=stable`
-  is the override that wins (a `rustup override` does **not** beat the file).
+- A Windows-host-qualified channel in `rust-toolchain.toml` makes bare `cargo`
+  fail on macOS with `target tuple in channel name`. Keep the repository pin
+  host-neutral and select `1.97.1-x86_64-pc-windows-gnu` explicitly only for
+  Windows ship builds.
 - winit only creates windows inside `ApplicationHandler::resumed`, but
   `Platform::init` has to hand back a live window. The fix is to
   `pump_app_events` in a bounded loop inside `init` until the handler has stored

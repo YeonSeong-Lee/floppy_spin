@@ -7,11 +7,12 @@
 //! ```text
 //! offset  size  field
 //! 0       4     magic b"FSPN"
-//! 4       1     version (SAVE_VERSION = 1)
+//! 4       1     version (SAVE_VERSION = 2)
 //! 5       5     garage part indices, [u8; 5] (garage::resolve input)
 //! 10      7     settings block (field order below)
 //! 17      1     XOR checksum: XOR of every byte at offsets 0..17
-//! ------- total: 18 bytes
+//! 18      4     CRC32 of bytes at offsets 0..18 (little endian)
+//! ------- total: 22 bytes
 //! ```
 //!
 //! Settings block, fixed field order (task spec: "document"):
@@ -45,19 +46,39 @@ use crate::minigame::Difficulty;
 /// Save file magic (SPEC §9).
 pub const MAGIC: [u8; 4] = *b"FSPN";
 /// Current save format version (SPEC §9).
-pub const SAVE_VERSION: u8 = 1;
+pub const SAVE_VERSION: u8 = 2;
 
 const PARTS_LEN: usize = 5;
 const SETTINGS_LEN: usize = 7;
 /// Total encoded length: magic(4) + version(1) + parts(5) + settings(7) +
-/// checksum(1).
-pub const SAVE_LEN: usize = 4 + 1 + PARTS_LEN + SETTINGS_LEN + 1;
+/// XOR checksum(1) + CRC32(4).
+pub const SAVE_LEN: usize = 4 + 1 + PARTS_LEN + SETTINGS_LEN + 1 + 4;
 
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 4;
 const OFF_PARTS: usize = 5;
 const OFF_SETTINGS: usize = OFF_PARTS + PARTS_LEN; // 10
 const OFF_CHECKSUM: usize = OFF_SETTINGS + SETTINGS_LEN; // 17
+const OFF_CRC32: usize = OFF_CHECKSUM + 1; // 18
+
+/// Result of classifying bytes read by a save adapter. Callers can report a
+/// damaged or obsolete file without ever partially applying it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SaveLoadOutcome {
+    Loaded(SaveState),
+    Missing,
+    Corrupt,
+    Incompatible { version: u8 },
+}
+
+impl SaveLoadOutcome {
+    pub fn state_or_default(self) -> SaveState {
+        match self {
+            Self::Loaded(state) => state,
+            Self::Missing | Self::Corrupt | Self::Incompatible { .. } => SaveState::default(),
+        }
+    }
+}
 
 /// Decoded save contents: the garage build's part indices plus the settings
 /// block. `Default` is exactly the "no save / corrupt save" fallback (SPEC
@@ -135,7 +156,7 @@ fn window_scale_from_byte(b: u8) -> Option<WindowScale> {
 }
 
 /// Encode `parts` + `settings` into the exact SPEC §9 byte layout (module
-/// docs above), including the trailing XOR checksum.
+/// docs above), including the trailing XOR checksum and CRC32.
 pub fn encode(parts: [u8; 5], settings: &GameSettings) -> Vec<u8> {
     let mut out = Vec::with_capacity(SAVE_LEN);
     out.extend_from_slice(&MAGIC);
@@ -149,9 +170,10 @@ pub fn encode(parts: [u8; 5], settings: &GameSettings) -> Vec<u8> {
     out.push(if settings.colorblind { 1 } else { 0 });
     out.push(0); // reserved padding byte (module docs)
 
-    debug_assert_eq!(out.len(), SAVE_LEN - 1, "layout drifted from SAVE_LEN");
+    debug_assert_eq!(out.len(), OFF_CHECKSUM, "layout drifted from SAVE_LEN");
     let checksum = out.iter().fold(0u8, |acc, &b| acc ^ b);
     out.push(checksum);
+    out.extend_from_slice(&crc32(&out).to_le_bytes());
     debug_assert_eq!(out.len(), SAVE_LEN);
     out
 }
@@ -160,44 +182,80 @@ pub fn encode(parts: [u8; 5], settings: &GameSettings) -> Vec<u8> {
 /// applies (module docs): the whole blob is validated before any field is
 /// read out; any failure returns `SaveState::default()`.
 pub fn decode(bytes: &[u8]) -> SaveState {
+    decode_outcome(bytes).state_or_default()
+}
+
+/// Validate and classify a complete v2 save blob.
+pub fn decode_outcome(bytes: &[u8]) -> SaveLoadOutcome {
+    if bytes.is_empty() {
+        return SaveLoadOutcome::Missing;
+    }
+    if bytes.len() > OFF_VERSION
+        && bytes.get(OFF_MAGIC..OFF_MAGIC + 4) == Some(MAGIC.as_slice())
+        && bytes[OFF_VERSION] != SAVE_VERSION
+    {
+        return SaveLoadOutcome::Incompatible {
+            version: bytes[OFF_VERSION],
+        };
+    }
     if bytes.len() != SAVE_LEN {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     }
     if bytes[OFF_MAGIC..OFF_MAGIC + 4] != MAGIC {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     }
     if bytes[OFF_VERSION] != SAVE_VERSION {
-        return SaveState::default();
+        return SaveLoadOutcome::Incompatible {
+            version: bytes[OFF_VERSION],
+        };
     }
     let checksum = bytes[..OFF_CHECKSUM].iter().fold(0u8, |acc, &b| acc ^ b);
     if checksum != bytes[OFF_CHECKSUM] {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
+    }
+    let expected_crc = u32::from_le_bytes([
+        bytes[OFF_CRC32],
+        bytes[OFF_CRC32 + 1],
+        bytes[OFF_CRC32 + 2],
+        bytes[OFF_CRC32 + 3],
+    ]);
+    if crc32(&bytes[..OFF_CRC32]) != expected_crc {
+        return SaveLoadOutcome::Corrupt;
+    }
+    if bytes[OFF_SETTINGS + 6] != 0 {
+        return SaveLoadOutcome::Corrupt;
+    }
+    if bytes[OFF_PARTS..OFF_PARTS + PARTS_LEN]
+        .iter()
+        .any(|&part| part >= 4)
+    {
+        return SaveLoadOutcome::Corrupt;
     }
 
     let music_vol = bytes[OFF_SETTINGS];
     let sfx_vol = bytes[OFF_SETTINGS + 1];
     let Some(shake) = shake_from_byte(bytes[OFF_SETTINGS + 2]) else {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     };
     let Some(difficulty) = difficulty_from_byte(bytes[OFF_SETTINGS + 3]) else {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     };
     let Some(window_scale) = window_scale_from_byte(bytes[OFF_SETTINGS + 4]) else {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     };
     let colorblind_byte = bytes[OFF_SETTINGS + 5];
     if colorblind_byte > 1 {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     }
     if music_vol > 10 || sfx_vol > 10 {
-        return SaveState::default();
+        return SaveLoadOutcome::Corrupt;
     }
 
     // Everything validated: NOW it's safe to apply (never partial).
     let mut parts = [0u8; PARTS_LEN];
     parts.copy_from_slice(&bytes[OFF_PARTS..OFF_PARTS + PARTS_LEN]);
 
-    SaveState {
+    SaveLoadOutcome::Loaded(SaveState {
         parts,
         settings: GameSettings {
             music_vol,
@@ -207,7 +265,20 @@ pub fn decode(bytes: &[u8]) -> SaveState {
             window_scale,
             colorblind: colorblind_byte == 1,
         },
+    })
+}
+
+/// CRC-32/ISO-HDLC, reflected polynomial 0xEDB88320.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
     }
+    !crc
 }
 
 #[cfg(test)]

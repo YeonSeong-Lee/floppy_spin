@@ -8,7 +8,7 @@ verifier review at the boundary. Cross-cutting invariants re-checked at EVERY mi
 
 | M | Scope | Exit gate |
 |---|---|---|
-| **M0** | Workspace scaffold (4 lib crates + root, forbid(unsafe) boundaries), rust-toolchain.toml (gnu host), release profile, `gate` bin (size + PE import allowlist parser), win32 window + GDI StretchDIBits blit of animated gradient, `headless` bin writing PNG via own stored-deflate encoder, .gitignore, fmt/clippy config | exe builds & runs, window shows animation, headless PNG opens, gate passes, `cargo test` green |
+| **M0** | Workspace scaffold (4 lib crates + root, forbid(unsafe) boundaries), rust-toolchain.toml (host-neutral pin; GNU host selected for ship builds), release profile, `gate` bin (size + PE import allowlist parser), win32 window + GDI StretchDIBits blit of animated gradient, `headless` bin writing PNG via own stored-deflate encoder, .gitignore, fmt/clippy config | exe builds & runs, window shows animation, headless PNG opens, gate passes, `cargo test` green |
 | **M1** | `fixmath` (sin/cos LUT, fixed-iteration sqrt/rsqrt, atan2, xorshift64, Vec2/Vec3 — camera transforms are built from basis vectors in M3, no matrix type), fixed 120 Hz timestep + render interpolation skeleton, `InputState`, FNV-1a frame hash, scripted-input harness | determinism test: two runs same seed+script → identical hash sequence; math property tests; no-libm grep test |
 | **M2** | Arena analytic heightfield + gradient, top dynamics (gravity/normal/slope/friction/decay), precession & topple, sphere collisions (de-penetration, restitution, knockback, drain, spin transfer, airborne), ring-out & stamina-out, launch trajectory, `BattleEvent`s, `TuneParams` block | invariant tests (collision symmetry & momentum, grounded stability, ring-out, topple), determinism green |
 | **M3** | Software renderer: fixed camera, perspective, near clip, backface cull, z-buffer, flat/Gouraud + specular + emissive, surface-of-revolution top meshes (silhouette params), bowl tessellation + neon rings, 5×7 font + vector-AA numerals, headless golden-frame infra + tolerance compare | golden frames render & compare; first visual build (tops rolling in bowl); perf sanity at 960×540 |
@@ -36,7 +36,8 @@ M0–M9 are code-complete and every automated gate was green on a clean checkout
    `main.rs`, `Cargo.toml`, and `src/platform/`, and per
    `docs/notes/ship-gate-clean-checkout.md` that resets the clock: the gate that
    counts is the one run on Windows on the latest commit. The macOS run
-   (319 tests, goldens at diff 0.000, clippy/fmt clean) is evidence, not a
+   (335 tests, goldens at diff 0.000, clippy/fmt clean as of 2026-09-04) is
+   evidence, not a
    substitute — it cannot measure the exe's size or its import table.
 
 ## Working method

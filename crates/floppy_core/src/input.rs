@@ -17,6 +17,69 @@ pub struct InputState {
     pub anchor: bool,
 }
 
+/// Host input sampled for one 60 Hz application tick.
+///
+/// `held` is the state at the end of the host poll. `pressed` and
+/// `released` are latches: both may be true when a key was tapped entirely
+/// between two ticks. This is intentionally independent of platform key
+/// codes so replay, headless, and window adapters share one contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FrameInput {
+    pub held: InputState,
+    pub pressed: InputState,
+    pub released: InputState,
+    pub escape_held: bool,
+    pub escape_pressed: bool,
+    pub escape_released: bool,
+    pub focused: bool,
+}
+
+impl Default for FrameInput {
+    fn default() -> Self {
+        Self {
+            held: InputState::default(),
+            pressed: InputState::default(),
+            released: InputState::default(),
+            escape_held: false,
+            escape_pressed: false,
+            escape_released: false,
+            // A synthetic/headless host is focused unless it explicitly
+            // reports otherwise. This also keeps `FrameInput::default()` a
+            // useful neutral input for deterministic tests.
+            focused: true,
+        }
+    }
+}
+
+impl FrameInput {
+    /// Compatibility constructor for callers that sample only held state.
+    /// New code should preserve host edge latches in `pressed`/`released`.
+    pub fn from_held(held: InputState, escape_held: bool) -> Self {
+        Self {
+            held,
+            escape_held,
+            focused: true,
+            ..Self::default()
+        }
+    }
+
+    /// Input delivered to a simulation substep. Directional and continuous
+    /// actions remain held, while one-shot actions exist only on substep 0.
+    pub fn for_substep(self, first: bool) -> InputState {
+        let mut input = self.held;
+        if first {
+            input.dash |= self.pressed.dash;
+            input.special |= self.pressed.special;
+            input.hop |= self.pressed.hop;
+        } else {
+            input.dash = false;
+            input.special = false;
+            input.hop = false;
+        }
+        input
+    }
+}
+
 /// Bit layout of the packed replay/scripting format (16 bits total):
 /// ```text
 /// bit:  0 1 | 2 3 | 4    | 5       | 6     | 7   | 8     | 9      | 10..15
@@ -128,5 +191,29 @@ mod tests {
         let packed = base.pack();
         let with_garbage = packed | 0xFC00; // set all reserved bits 10..15
         assert_eq!(InputState::unpack(with_garbage), base);
+    }
+
+    #[test]
+    fn one_shot_actions_only_reach_the_first_substep() {
+        let frame = FrameInput {
+            held: InputState {
+                guard: true,
+                carve: true,
+                ..InputState::default()
+            },
+            pressed: InputState {
+                dash: true,
+                special: true,
+                hop: true,
+                ..InputState::default()
+            },
+            focused: true,
+            ..FrameInput::default()
+        };
+        let first = frame.for_substep(true);
+        let second = frame.for_substep(false);
+        assert!(first.dash && first.special && first.hop);
+        assert!(!second.dash && !second.special && !second.hop);
+        assert!(second.guard && second.carve);
     }
 }

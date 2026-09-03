@@ -29,16 +29,18 @@ Companion docs: `game_design.md` (what makes it fun — combat, roster, feel),
 
 ## 2. Toolchain & build (decision record)
 
-**Decision:** build natively on Windows with the rustup **`stable-x86_64-pc-windows-gnu`
-host toolchain**, pinned by `rust-toolchain.toml`. The original spec assumed
+**Decision:** build natively on Windows with the rustup
+**`1.97.1-x86_64-pc-windows-gnu` host toolchain**, selected explicitly for ship
+builds. `rust-toolchain.toml` pins the same compiler version in host-neutral
+form so macOS development works with bare Cargo commands. The original spec assumed
 cross-compilation from Linux via MinGW-w64; this machine is Windows 11 and has no MinGW.
 The gnu host toolchain is self-sufficient (bundles `rust-mingw`: binutils `ld`, CRT
 startup objects, and system-DLL import libraries), so the same target triple (C2) is
 produced with zero extra installs. Verified 2026-07-03: hello-world with the C10 release
 profile builds, runs, and is 241,664 bytes.
 
-- Build: `cargo build --release` (default target of the pinned toolchain is
-  `x86_64-pc-windows-gnu`).
+- Ship build: `cargo +1.97.1-x86_64-pc-windows-gnu build --release` (the GNU
+  host toolchain's default target is `x86_64-pc-windows-gnu`).
 - The msvc toolchain must not be used for shipping builds (different CRT/ABI, drags in
   `vcruntime` unless static).
 - The macOS dev backend (winit+softbuffer+cpal, safe Rust) is cfg-gated behind
@@ -48,8 +50,8 @@ profile builds, runs, and is 241,664 bytes.
   said it could not be compiled or tested — that was true only of the Windows
   machine the record was written on): `cargo test --workspace --release` and
   `--golden check` are green on `aarch64-apple-darwin`, all six goldens at
-  mean-abs-diff 0.000. `rust-toolchain.toml` pins a Windows *host* toolchain, so
-  macOS invocations must select the host toolchain with `RUSTUP_TOOLCHAIN=stable`.
+  mean-abs-diff 0.000. The host-neutral toolchain pin means those macOS
+  invocations now work directly without a `RUSTUP_TOOLCHAIN` override.
   Each backend is re-exported as `platform::backend`, and `main.rs` is not
   cfg-split, so a macOS compile exercises the same `main.rs` source Windows
   compiles. The gates that judge the shipped artifact (§12.3 size/imports and
@@ -75,7 +77,7 @@ Cargo workspace:
 ```
 floppy_spin/
 ├── Cargo.toml            # workspace + root package `floppy_spin`
-├── rust-toolchain.toml   # pins stable-x86_64-pc-windows-gnu
+├── rust-toolchain.toml   # pins Rust 1.97.1, host-neutral
 ├── crates/
 │   ├── floppy_core/      # deterministic 3D sim: math, physics, combat, AI, flow  [forbid(unsafe)]
 │   ├── floppy_render/    # 3D software renderer + HUD/menus drawing               [forbid(unsafe)]

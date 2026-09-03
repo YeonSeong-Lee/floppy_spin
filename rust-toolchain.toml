@@ -1,5 +1,8 @@
-# Pin the gnu HOST toolchain: it bundles MinGW binutils + system-DLL import libs,
-# so the x86_64-pc-windows-gnu target (SPEC C2) links with zero external installs.
-# The msvc toolchain cannot link this target (verified 2026-07-03, see SPEC §2).
+# Keep the compiler host-neutral. Cross compilation is selected with
+# `--target`; encoding a target triple in `channel` makes rustup look for a
+# non-existent release channel on macOS and Linux.
 [toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
+channel = "1.97.1"
+targets = ["x86_64-pc-windows-gnu"]
+components = ["rustfmt", "clippy"]
+profile = "minimal"
